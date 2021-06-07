@@ -25,6 +25,7 @@ use uefi::table::boot::OpenAttribute;
 use core::fmt::{self, Write};
 use core::str;
 use core::fmt::*;
+use core::mem;
 
 use alloc::boxed::*;
 
@@ -59,11 +60,78 @@ extern "efiapi" fn my_feed(this: &SimpleAudioOut, sample: *const u8, sample_coun
 
 //
 // DriverBinding
-//
+
+// /// PCI Device header region in PCI Configuration Space
+// /// Section 6.1, PCI Local Bus Specification, 2.2
+// #[repr(packed)]
+// struct PciDeviceIndependentRegion {
+//     vendor_id: u16,
+//     device_id: u16,
+//     command: u16,
+//     status: u16,
+//     revision_id: u8,
+//     class_code: [u8; 3],
+//     cache_line_size: u8,
+//     latency_timer: u8,
+//     header_type: u8,
+//     bist: u8,
+// }
+
+// /// PCI Device header region in PCI Configuration Space
+// /// Section 6.1, PCI Local Bus Specification, 2.2
+// #[repr(packed)]
+// struct PciDeviceHeaderTypeRegion {
+//     base_address_registers: [u32; 6],
+//     cardbus_cis_pointer: u32,
+//     subsystem_vendor_id: u16,
+//     subsystem_id: u16,
+//     expansion_rom_base_address: u32,
+//     capability_ptr: u8,
+//     reserved1: [u8; 3],
+//     reserved2: u32,
+//     interrupt_line: u8,
+//     interrupt_pin: u8,
+//     min_gnt: u8,
+//     max_lat: u8,
+// }
+
+// /// PCI Device Configuration Space
+// /// Section 6.1, PCI Local Bus Specification, 2.2
+// #[repr(packed)]
+// struct PciType00 {
+//     header: PciDeviceIndependentRegion,
+//     device: PciDeviceHeaderTypeRegion,
+// }
+
+/// PCI Device Configuration Space
+/// Section 6.1, PCI Local Bus Specification, 2.2
+#[repr(packed)]
+struct PciType00 {
+    vendor_id: u16,
+    device_id: u16,
+    command: u16,
+    status: u16,
+    revision_id: u8,
+    class_code: [u8; 3],
+    cache_line_size: u8,
+    latency_timer: u8,
+    header_type: u8,
+    bist: u8,
+    base_address_registers: [u32; 6],
+    cardbus_cis_pointer: u32,
+    subsystem_vendor_id: u16,
+    subsystem_id: u16,
+    expansion_rom_base_address: u32,
+    capability_ptr: u8,
+    reserved1: [u8; 3],
+    reserved2: u32,
+    interrupt_line: u8,
+    interrupt_pin: u8,
+    min_gnt: u8,
+    max_lat: u8,
+}
 
 extern "efiapi" fn my_supported(this: &DriverBinding, handle: Handle, remaining_path: *mut DevicePath) -> Status {
-    info!("my_supported");
-
     let bt = unsafe { uefi_services::system_table().as_ref().boot_services() };
 
     let pci = bt
@@ -73,6 +141,28 @@ extern "efiapi" fn my_supported(this: &DriverBinding, handle: Handle, remaining_
     let device_path = bt
         .open_protocol::<DevicePath>(handle, this.driver_handle(), handle, OpenAttribute::GET_PROTOCOL)
         .log_warning()?;
+
+    info!("my_supported -- got PCI and DEVICE_PATH");
+
+    let pci = unsafe { &*pci.as_proto().get() };
+
+    let mut type00 : PciType00 = unsafe { mem::uninitialized() };
+    let mut buffer = unsafe { core::slice::from_raw_parts_mut(mem::transmute(&type00), mem::size_of_val(&type00)) };
+    pci.read_config(uefi::proto::pci::IoWidth::U8, 0, buffer)
+        .map(|completion| {
+            let (status, result) = completion.split();
+            info!("read_config type00: {:?}", status);
+            result
+        })
+        .map_err(|error| {
+            error!("read_config type00: {:?}", error.status());
+            error
+        })?;
+
+    info!("vendor: {:x}, device: {:x}", type00.vendor_id, type00.device_id);
+    if type00.vendor_id != 0x8086 || type00.device_id != 0x2415 {
+        return uefi::Status::UNSUPPORTED;
+    }
 
     info!("my_supported -- ok");
 
@@ -123,22 +213,6 @@ extern "efiapi" fn my_start(this: &DriverBinding, handle: Handle, remaining_path
         })
         .map_err(|error| {
             error!("failed to install audio protocol: {:?}", error.status());
-            error.status().into()
-        })?;
-
-    let audio_out1 = Box::new(SimpleAudioOut {
-        reset: my_reset,
-        feed: my_feed
-    });
-
-    bt.install_interface::<SimpleAudioOut>(handle, audio_out1)
-        .map(|completion| {
-            let (status, result) = completion.split();
-            info!("install audio (2) protocol: {:?}", status);
-            result
-        })
-        .map_err(|error| {
-            error!("failed to install (2) audio protocol: {:?}", error.status());
             error.status().into()
         })?;
 
