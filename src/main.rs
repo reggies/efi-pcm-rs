@@ -1,7 +1,17 @@
+// TBD: -- implement my_unload
+// TBD: -- per device context
+// TBD: -- close_protocol result is ignored
+// TBD: -- ComponentName and ComponentName2
+// TBD: -- using BOX across FFI is UB
+
 #![no_std]
 #![no_main]
 #![feature(abi_efiapi)]
 #![allow(unused_imports)]
+#![allow(unused_variables)]
+
+// TBD: for static assert
+#![feature(const_panic)]
 
 // TBD: necessary for derive(Protocol) in our crate
 #![feature(negative_impls)]
@@ -61,9 +71,13 @@ extern "efiapi" fn my_feed(this: &SimpleAudioOut, sample: *const u8, sample_coun
 //
 // DriverBinding
 
+// TBD: this is supposed to be packed even though all registers are naturally aligned in C.
+// Rustc complains that _creating_ unaligned references is UB. What should we do?
 /// PCI Device Configuration Space
 /// Section 6.1, PCI Local Bus Specification, 2.2
-#[repr(C, packed)]
+// #[repr(C, packed)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
 struct PciType00 {
     vendor_id: u16,
     device_id: u16,
@@ -89,10 +103,10 @@ struct PciType00 {
     max_lat: u8,
 }
 
-// TBD: this is supposed to be packed even though all registers are naturally aligned.
-// Rustc complains that _creating_ unaligned references is UB. What should we do?
-#[repr(C, packed)]
-#[derive(Debug, Default)]
+// TBD: see comments above
+// #[repr(C, packed)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
 struct BaseRegisterSet {
     reset: u16,
     master_volume: u16,
@@ -113,20 +127,37 @@ struct BaseRegisterSet {
     general_purpose: u16,
     _3d_control: u16,
     audio_int_and_paging: u16,
-    powerdown_ctrl_stat: u16,
-    extended_audio: [u16; 9],
-    extended_modem: [u16; 14],
-    vendor_reserved: [u8; 5],
+    powerdown_ctrl_stat: u16,                            // 26h-28h
+    extended_audio: [u16; 10],
+    extended_modem: [u16; 15],
+    vendor_reserved: [u16; 3],
     page_registers: [u16; 8],
-    vendor_reserved2: [u8; 10],
-    vendor_id1: u8,
-    vendor_id2: u8,
+    vendor_reserved2: [u16; 6],
+    vendor_id1: u16,
+    vendor_id2: u16,
 }
 
+macro_rules! static_assert {
+    ($cond:expr) => {
+        static_assert!($cond, concat!("assertion failed: ", stringify!($cond)));
+    };
+    ($cond:expr, $($t:tt)+) => {
+        #[forbid(const_err)]
+        const _: () = {
+            if !$cond {
+                core::panic!($($t)+)
+            }
+        };
+    };
+}
+
+static_assert!(mem::size_of::<BaseRegisterSet>() == 0x80);
+
 fn dump_registers(pci: &PciIO) -> uefi::Result {
+    // TBD: why uninit?
     let mut registers = mem::MaybeUninit::<BaseRegisterSet>::uninit();
     let buffer = unsafe {
-        core::slice::from_raw_parts_mut(mem::transmute(registers.as_mut_ptr()), mem::size_of::<BaseRegisterSet>())
+        core::slice::from_raw_parts_mut(registers.as_mut_ptr().cast(), mem::size_of::<BaseRegisterSet>())
     };
 
     pci.read_io::<u16>(uefi::proto::pci::IoRegister::R0, 0, buffer)
@@ -140,8 +171,7 @@ fn dump_registers(pci: &PciIO) -> uefi::Result {
             error
         })?;
 
-    let registers = unsafe { registers.assume_init() };
-    info!("registers: {:#?}", registers);
+    info!("registers: {:#x?}", unsafe { registers.assume_init() });
 
     Ok(().into())
 }
@@ -158,7 +188,7 @@ extern "efiapi" fn my_supported(this: &DriverBinding, handle: Handle, remaining_
     pci.with_proto(|pci| {
         let mut type00 = mem::MaybeUninit::<PciType00>::uninit();
         let buffer = unsafe {
-            core::slice::from_raw_parts_mut(mem::transmute(type00.as_mut_ptr()), mem::size_of::<PciType00>())
+            core::slice::from_raw_parts_mut(type00.as_mut_ptr().cast(), mem::size_of::<PciType00>())
         };
         pci.read_config::<u8>(0, buffer)
             .map(|completion| {
@@ -171,7 +201,7 @@ extern "efiapi" fn my_supported(this: &DriverBinding, handle: Handle, remaining_
                 error
             })?;
         let type00 = unsafe { type00.assume_init() };
-        info!("vendor: {:x}, device: {:x}", type00.vendor_id, type00.device_id);
+        info!("vendor: {:#x}, device: {:#x}", type00.vendor_id, type00.device_id);
         if type00.vendor_id != 0x8086 || type00.device_id != 0x2415 {
             return uefi::Status::UNSUPPORTED.into();
         }
@@ -181,6 +211,79 @@ extern "efiapi" fn my_supported(this: &DriverBinding, handle: Handle, remaining_
     info!("my_supported -- ok");
 
     uefi::Status::SUCCESS
+}
+
+// TBD: -- supposed to be packed
+// #[repr(C, packed)]
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct Descriptor {
+    address: u32,
+    length: u16,
+    control: u16
+}
+
+// TBD: -- supposed to be packed
+// but pointers might become unaligned as produced by Box::new
+// #[repr(C, packed)]
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct Buffers {
+    descriptors: [Descriptor; 32],
+    pointers: [*const i16; 32],
+    buffers: [[i16; 65536]; 32]
+}
+
+// #[repr(C)]
+// union RawBuffers {
+//     buffers: Buffers,
+//     raw: [u8; mem::size_of::<Buffers>()]
+// }
+
+fn init_audio_codec(pci: &PciIO) -> uefi::Result {
+    // TBD: unstable feature
+    // let mut buffer = Box::<Buffers>::new_zeroed();
+
+    // Careful now, we might be doing a bad thing creating
+    // unaligned pointers inside the struct like this.
+    // Also, allocating big structure must be made entirely
+    // on the heap.
+
+    use alloc::vec::Vec;
+    let mut vec_buffer : Vec<Buffers> = Vec::with_capacity(1);
+
+    unsafe {
+        vec_buffer.set_len(1);
+    }
+
+    // I believe this is safe to access union field because it is trivially copyable
+    let buffer_ptr = vec_buffer.as_mut_ptr().cast();
+
+    let mapping = pci
+        .map(uefi::proto::pci::IoOperation::BusMasterWrite, buffer_ptr, mem::size_of::<Buffers>())
+        .map(|completion| {
+            let (status, result) = completion.split();
+            info!("map operation: {:?}", status);
+            result
+        })
+        .map_err(|error| {
+            error!("map operation failed: {:?}", error.status());
+            error
+        })?;
+
+    pci.unmap(mapping)
+        .discard_errdata()                               // dicard mapping if failed to unmap
+        .map(|completion| {
+            let (status, result) = completion.split();
+            info!("unmap operation: {:?}", status);
+            result
+        })
+        .map_err(|error| {
+            error!("unmap operation failed: {:?}", error.status());
+            error
+        })?;
+
+    Ok(().into())
 }
 
 extern "efiapi" fn my_start(this: &DriverBinding, handle: Handle, remaining_path: *mut DevicePath) -> Status {
@@ -222,6 +325,10 @@ extern "efiapi" fn my_start(this: &DriverBinding, handle: Handle, remaining_path
         .log_warning()
         .expect("no problem");
 
+    pci.with_proto(init_audio_codec)
+        .log_warning()
+        .expect("not problem init");
+
     // consume PCI I/O
     uefi::table::boot::leak(pci);
 
@@ -230,7 +337,7 @@ extern "efiapi" fn my_start(this: &DriverBinding, handle: Handle, remaining_path
     uefi::Status::SUCCESS
 }
 
-extern "efiapi" fn my_stop(this: &DriverBinding, controller: Handle, num_child_controller: usize, child_controller: *mut Handle) -> Status {
+extern "efiapi" fn my_stop(this: &DriverBinding, controller: Handle, _num_child_controller: usize, _child_controller: *mut Handle) -> Status {
     info!("my_stop");
 
     let bt = unsafe { uefi_services::system_table().as_ref().boot_services() };
@@ -261,6 +368,7 @@ extern "efiapi" fn my_stop(this: &DriverBinding, controller: Handle, num_child_c
             error
         })?;
 
+    // This is safe assuming that audio_out was created by us
     let audio_out = unsafe { Box::from_raw(audio_out.as_proto().get()) };
 
     bt.uninstall_interface::<SimpleAudioOut>(controller, audio_out)
@@ -283,7 +391,7 @@ extern "efiapi" fn my_stop(this: &DriverBinding, controller: Handle, num_child_c
 // Entry point
 //
 
-extern "efiapi" fn my_unload(image_handle: Handle) -> Status {
+extern "efiapi" fn my_unload(_image_handle: Handle) -> Status {
     info!("my_unload");
     uefi::Status::UNSUPPORTED
 }
