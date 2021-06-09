@@ -1,16 +1,7 @@
-#![allow(unused_imports)]
-
 use uefi::prelude::*;
-use uefi::proto::device_path::DevicePath;
-use uefi::proto::driver_binding::DriverBinding;
 use uefi::proto::pci::PciIO;
-use uefi::proto::console::text::Input;
 
-use core::fmt::{self, Write};
-use core::str;
-use core::fmt::*;
-
-use crate::proto::SimpleAudioOut;
+use efi_pcm::SimpleAudioOut;
 
 pub fn connect_pci_recursively() {
 

@@ -1,0 +1,17 @@
+* TODO do not leak events
+* TODO proper sample scheduling with no lost frames
+* TODO react on ExitBootServices
+* TODO implement reset
+* TODO implement tone
+* TODO understand how OpenCorePkg represents audio data and audio protocols
+  - BeepGen -- done
+  - PlayTone -- same as BeepGen but for HDA
+  - VoiceOver -- opaque
+* TODO ComponentName and ComponentName2
+* TODO using BOX across FFI is UB
+* TODO link scripts for global objects
+* DONE unload crash when exit from shell
+  - didn't I fix this?
+* DONE implement feed
+  - AC97 bus master registers and slots
+    - https://wiki.osdev.org/AC97#Native_Audio_Bus_Master_registers
