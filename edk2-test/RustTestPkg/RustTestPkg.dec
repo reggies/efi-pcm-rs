@@ -1,0 +1,12 @@
+[Defines]
+  DEC_SPECIFICATION              = 0x00010005
+  PACKAGE_NAME                   = RustTestPkg
+  PACKAGE_GUID                   = 652d6a15-7c19-42ec-8900-9b1475fded4d
+  PACKAGE_VERSION                = 1.0
+
+[Includes]
+  Include
+
+[Protocols]
+  # gEfiSimpleAudioOutProtocolGuid          = { 0x663dede4, 0x0264, 0x8d4f, { 0x90, 0x2d, 0x5c, 0x67, 0xd5, 0xd4, 0x98, 0x82 }}
+  gEfiSimpleAudioOutProtocolGuid          = { 0xe4ed3d66, 0x6402, 0x4f8d, { 0x90, 0x2d, 0x5c, 0x67, 0xd5, 0xd4, 0x98, 0x82 }}

@@ -1,0 +1,27 @@
+[Defines]
+  INF_VERSION                    = 0x00010005
+  BASE_NAME                      = Launcher
+  FILE_GUID                      = f239e29d-8bfd-47ce-a93e-76e2f2e0dced
+  MODULE_TYPE                    = UEFI_APPLICATION
+  VERSION_STRING                 = 1.0
+  ENTRY_POINT                    = UefiMain
+
+[Sources]
+  Launcher.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  RustTestPkg/RustTestPkg.dec
+
+[LibraryClasses]
+  BaseMemoryLib
+  DebugLib
+  UefiBootServicesTableLib
+  UefiApplicationEntryPoint
+  MemoryAllocationLib
+  UefiLib
+  PcdLib
+  PrintLib
+
+[Protocols]
+  gEfiSimpleAudioOutProtocolGuid

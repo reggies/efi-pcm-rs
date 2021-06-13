@@ -1,0 +1,41 @@
+#ifndef __SIMPLEAUDIOOUT_H__
+#define __SIMPLEAUDIOOUT_H__
+
+#include <Uefi.h>
+
+#define EFI_SIMPLE_AUDIO_OUT_PROTOCOL_GUID \
+  { 0xe4ed3d66, 0x6402, 0x4f8d, { 0x90, 0x2d, 0x5c, 0x67, 0xd5, 0xd4, 0x98, 0x82 }}
+
+typedef struct _EFI_SIMPLE_AUDIO_OUT_PROTOCOL EFI_SIMPLE_AUDIO_OUT_PROTOCOL;
+
+typedef
+EFI_STATUS
+(EFIAPI * EFI_SIMPLE_AUDIO_OUT_TONE) (
+    IN EFI_SIMPLE_AUDIO_OUT_PROTOCOL *This,
+    IN INT16 Frequency,
+    IN UINT16 Duration
+    );
+
+typedef
+EFI_STATUS
+(EFIAPI * EFI_SIMPLE_AUDIO_OUT_RESET) (
+    IN EFI_SIMPLE_AUDIO_OUT_PROTOCOL *This
+    );
+
+typedef
+EFI_STATUS
+(EFIAPI * EFI_SIMPLE_AUDIO_OUT_FEED) (
+    IN EFI_SIMPLE_AUDIO_OUT_PROTOCOL *This,
+    IN INT16 *Samples,
+    IN UINTN SampleCount
+    );
+
+struct _EFI_SIMPLE_AUDIO_OUT_PROTOCOL {
+    EFI_SIMPLE_AUDIO_OUT_RESET Reset;
+    EFI_SIMPLE_AUDIO_OUT_FEED Feed;
+    EFI_SIMPLE_AUDIO_OUT_TONE Tone;
+};
+
+extern EFI_GUID gEfiSimpleAudioOutProtocolGuid;
+
+#endif
