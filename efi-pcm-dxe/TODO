@@ -1,8 +1,14 @@
-* TODO do not leak events
 * TODO proper sample scheduling with no lost frames
+** in particular proper timer intervals
 * TODO react on ExitBootServices
 * TODO implement reset
+** TODO what exactly should I implement here?
+* TODO extend the API for other PCM formats, sampling rates, channel count and volume
 * TODO implement tone
+** use timers to stop beep
+** BUG sampling rate lesser than 44100 does not work
+** how to emit silence?
+** duration smaller than 500 ms does not work
 * TODO understand how OpenCorePkg represents audio data and audio protocols
   - BeepGen -- done
   - PlayTone -- same as BeepGen but for HDA

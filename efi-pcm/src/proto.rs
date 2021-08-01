@@ -9,7 +9,7 @@ type FeedFn =
     extern "efiapi" fn(this: &mut SimpleAudioOut, sample_rate: u32, samples: *const u16, sample_count: usize) -> uefi::Status;
 
 type ToneFn =
-    extern "efiapi" fn(this: &mut SimpleAudioOut, freq: i16, duration: u16) -> uefi::Status;
+    extern "efiapi" fn(this: &mut SimpleAudioOut, freq: u16, duration: u16) -> uefi::Status;
 
 #[repr(C)]
 #[unsafe_guid("e4ed3d66-6402-4f8d-902d-5c67d5d49882")]
@@ -24,7 +24,7 @@ pub struct SimpleAudioOut {
 }
 
 impl SimpleAudioOut {
-    pub fn tone(&mut self, freq: i16, duration: u16) -> uefi::Result {
+    pub fn tone(&mut self, freq: u16, duration: u16) -> uefi::Result {
         (self.tone)(self, freq, duration)
             .into()
     }
