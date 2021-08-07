@@ -6,25 +6,34 @@ use core::str;
 use core::mem;
 
 mod serial;
+mod stderr;
 
 static mut SYSTEM_TABLE: Option<uefi::table::SystemTable<uefi::table::Boot>> = None;
-static mut LOGGER: Option<serial::Logger> = None;
+static mut LOGGER: Option<stderr::Logger> = None;
 
-unsafe fn init_logger(st: &uefi::table::SystemTable<uefi::table::Boot>) -> uefi::Result {
-    let serial = st
-        .boot_services()
-        .locate_protocol::<uefi::proto::console::serial::Serial>()
-        .warning_as_error()?;
+// unsafe fn init_serial_logger(st: &uefi::table::SystemTable<uefi::table::Boot>) -> () {
+//     st.boot_services()
+//         .locate_protocol::<uefi::proto::console::serial::Serial>()
+//         .warning_as_error()
+//         .ok()
+//         .map(|serial| {
+//             let logger = {
+//                 LOGGER = Some(serial::Logger::new(&mut *serial.get()));
+//                 LOGGER.as_ref().unwrap()
+//             };
+//             log::set_logger(logger).unwrap();
+//             log::set_max_level(log::LevelFilter::Info);
+//         });
+// }
 
+unsafe fn init_logger(st: &'static uefi::table::SystemTable<uefi::table::Boot>) -> () {
     let logger = {
-        LOGGER = Some(serial::Logger::new(&mut *serial.get()));
+        LOGGER = Some(stderr::Logger::new(st));
         LOGGER.as_ref().unwrap()
     };
 
     log::set_logger(logger).unwrap();
     log::set_max_level(log::LevelFilter::Info);
-
-    Ok (().into())
 }
 
 pub fn boot_services() -> &'static uefi::table::boot::BootServices {
@@ -34,8 +43,7 @@ pub fn boot_services() -> &'static uefi::table::boot::BootServices {
 pub fn init(handle: uefi::Handle, system_table: &SystemTable<Boot>) -> uefi::Result {
     unsafe {
         SYSTEM_TABLE = Some(system_table.unsafe_clone());
-        init_logger(&system_table)
-            .warning_as_error()?;
+        init_logger(SYSTEM_TABLE.as_ref().unwrap());
         uefi::alloc::init(system_table.boot_services());
     }
     Ok (().into())

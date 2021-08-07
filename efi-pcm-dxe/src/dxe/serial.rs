@@ -30,7 +30,7 @@ impl<'boot> log::Log for Logger {
     fn log(&self, record: &log::Record) {
         if let Some(mut ptr) = self.writer {
             let writer = unsafe { ptr.as_mut() };
-            writeln!(writer, "{}", record.args()).unwrap();
+            let _ = writeln!(writer, "{}: {}", record.level(), record.args());
         }
     }
 
