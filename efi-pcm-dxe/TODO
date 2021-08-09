@@ -1,3 +1,4 @@
+* TODO look at snd_pcm_writei() from alsa
 * TODO proper sample scheduling with no lost frames
 ** in particular proper timer intervals
 * TODO react on ExitBootServices

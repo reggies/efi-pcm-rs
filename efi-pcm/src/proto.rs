@@ -18,9 +18,6 @@ pub struct SimpleAudioOut {
     pub reset: ResetFn,
     pub feed: FeedFn,
     pub tone: ToneFn,
-
-    // pub acquire: Event,
-    // pub release: Event,
 }
 
 impl SimpleAudioOut {
@@ -31,31 +28,5 @@ impl SimpleAudioOut {
     pub fn feed(&mut self, sample_rate: u32, samples: &[u16]) -> uefi::Result {
         (self.feed)(self, sample_rate, samples.as_ptr(), samples.len())
             .into()
-    }
-}
-
-impl Drop for SimpleAudioOut {
-    fn drop(&mut self) {
-        info!("my audio is dropped");
-    }
-}
-
-type ResetExFn =
-    unsafe extern "efiapi" fn(this: &mut SimpleAudioOutEx) -> uefi::Status;
-
-type FeedExFn =
-    unsafe extern "efiapi" fn(this: &mut SimpleAudioOutEx, samples: *const u16, sample_count: usize) -> uefi::Status;
-
-#[repr(C)]
-#[unsafe_guid("96a65861-392c-49a4-85a9-690036316aa8")]
-#[derive(Protocol)]
-pub struct SimpleAudioOutEx {
-    pub reset: ResetExFn,
-    pub feed: FeedExFn,
-}
-
-impl Drop for SimpleAudioOutEx {
-    fn drop(&mut self) {
-        info!("my audio ex is dropped");
     }
 }

@@ -21,9 +21,7 @@ use uefi::prelude::*;
 use efi_pcm::SimpleAudioOut;
 
 // fn load_samples() -> uefi::Result {
-    
 //     let bt = unsafe { uefi_services::system_table().as_ref().boot_services() };
-
 //     let sfs = bt.locate_protocol::<SimpleFileSystem>()
 //         .warning_as_error()?;
 //     // let sfs = sfs.expect("Cannot open `SimpleFileSystem` protocol");
@@ -52,31 +50,8 @@ use efi_pcm::SimpleAudioOut;
 //     directory.reset_entry_readout().unwrap().unwrap();
 // }
 
-#[entry]
-fn efi_main(_handle: uefi::Handle, system_table: SystemTable<Boot>) -> uefi::Status {
-
-    uefi_services::init(&system_table)
-        .expect_success("this is only the beginning");
-
-    info!("efi_main");
-
-    connect::connect_pci_recursively();
-
-    connect::enum_simple_audio_out();
-
-    info!("efi_main -- ok");
-
-    let bt = unsafe { uefi_services::system_table().as_ref().boot_services() };
-
-    let audio_out = bt
-        .locate_protocol::<SimpleAudioOut>()
-        .log_warning()?;
-
-    let audio_out = unsafe { &mut *audio_out.get() };
-
-    // let my_data = load_samples()?;
-    // audio_out.feed(22100, TEST_DATA).log_warning()?;
-
+fn test_tone(audio_out: &mut SimpleAudioOut) -> uefi::Result {
+    
     const C3: u16 = 130;
     const D3: u16 = 146;
     const D3SHARP: u16 = 155;
@@ -152,6 +127,36 @@ fn efi_main(_handle: uefi::Handle, system_table: SystemTable<Boot>) -> uefi::Sta
         audio_out.tone(freq, duration)
             .log_warning()?;
     }
+
+    Ok(().into())
+}
+
+#[entry]
+fn efi_main(_handle: uefi::Handle, system_table: SystemTable<Boot>) -> uefi::Status {
+
+    uefi_services::init(&system_table)
+        .expect_success("this is only the beginning");
+
+    info!("efi_main");
+
+    connect::connect_pci_recursively();
+
+    connect::enum_simple_audio_out();
+
+    info!("efi_main -- ok");
+
+    let bt = unsafe { uefi_services::system_table().as_ref().boot_services() };
+
+    let audio_out = bt
+        .locate_protocol::<SimpleAudioOut>()
+        .log_warning()?;
+
+    let audio_out = unsafe { &mut *audio_out.get() };
+
+    // let my_data = load_samples()?;
+    audio_out.feed(22100, data::TEST_DATA).log_warning()?;
+
+    // test_tone(audio_out).warning_as_error()?;
 
     uefi::Status::SUCCESS
 }

@@ -6,11 +6,6 @@
 
 #![deny(unaligned_references)]
 
-// For DXE stuff, from uefi-services
-#![feature(lang_items)]
-#![feature(panic_info_message)]
-#![feature(alloc_error_handler)]
-
 #![feature(new_uninit)]
 
 // TBD: for static assert
@@ -27,6 +22,7 @@ extern crate memoffset;
 #[macro_use]
 extern crate bitflags;
 extern crate efi_pcm;
+extern crate efi_dxe;
 
 use bitflags::bitflags;
 use uefi::prelude::*;
@@ -43,9 +39,7 @@ use core::fmt::*;
 use core::mem;
 use alloc::boxed::*;
 
-mod dxe;
-
-use dxe::*;
+use efi_dxe::*;
 use efi_pcm::*;
 
 // TBD: this is supposed to be packed even though all registers are naturally aligned in C.
@@ -144,7 +138,7 @@ struct Descriptor {
 }
 
 const BUFFER_SIZE: usize = 1 << 15;
-const BUFFER_COUNT: usize = 2;
+const BUFFER_COUNT: usize = 32;
 
 // For ICH7 max number of buffers is 32. The data should be
 // aligned on 8-byte boundaries. Each buffer descriptor is 8
@@ -253,7 +247,8 @@ struct DeviceContext {
 }
 
 impl DeviceContext {
-    fn from_protocol<'a>(raw: *const SimpleAudioOut) -> Option<&'a DeviceContext> {
+    // BootServices reference is only needed to inherit its lifetime
+    fn from_protocol<'a>(_bs: &'a uefi::table::boot::BootServices, raw: *const SimpleAudioOut) -> Option<&'a DeviceContext> {
         use memoffset::offset_of;
         let offset_bytes = memoffset::offset_of!(DeviceContext, for_plebs);
         let context: *const DeviceContext = unsafe {
@@ -269,7 +264,8 @@ impl DeviceContext {
         None
     }
 
-    fn from_protocol_mut<'a>(raw: *mut SimpleAudioOut) -> Option<&'a mut DeviceContext> {
+    // BootServices reference is only needed to inhert its lifetime
+    fn from_protocol_mut<'a>(_bs: &'a uefi::table::boot::BootServices, raw: *mut SimpleAudioOut) -> Option<&'a mut DeviceContext> {
         use memoffset::offset_of;
         let offset_bytes = memoffset::offset_of!(DeviceContext, for_plebs);
         let context: *mut DeviceContext = unsafe {
@@ -602,7 +598,7 @@ fn init_playback(pci: &PciIO, sampling_rate: u32, device: &mut DeviceContext) ->
     Ok (().into())
 }
 
-fn play_samples(pci: &PciIO, sampling_rate: u32, buffer_count: usize, sample_count: usize, device: &mut DeviceContext) -> uefi::Result {
+fn play_samples(pci: &PciIO, channel_count: u16, sampling_rate: u32, buffer_count: usize, sample_count: usize, device: &mut DeviceContext) -> uefi::Result {
 
     // Disable interrupts in PCM OUT transfer control register and
     // set Reset Registers (RR) bit
@@ -629,6 +625,15 @@ fn play_samples(pci: &PciIO, sampling_rate: u32, buffer_count: usize, sample_cou
         .warning_as_error()?;
 
     for lvi in 0..buffer_count as u8 {
+        // Calculate the delay between buffers in 100ns intervals
+        let buffers = unsafe { &mut *device.buffers };
+        let buffer_size = buffers.descriptors[lvi as usize].length;
+        let delay = milliseconds_to_timer_period(1000 * buffer_size as u64 / channel_count as u64 / sampling_rate as u64);
+
+        boot_services()
+            .set_timer(device.timer_event.unwrap(), uefi::table::boot::TimerTrigger::Relative(delay))
+            .warning_as_error()?;
+
         // Set bit for transferring data in transfer control register (bit 0) - 0x15 (0b10101)
         write_register_byte(pci, CONTROL_PCM_OUT, CONTROL_DMA_BIT | CONTROL_LVBCI_BIT | CONTROL_FIFOE_BIT)
             .warning_as_error()?;
@@ -637,22 +642,9 @@ fn play_samples(pci: &PciIO, sampling_rate: u32, buffer_count: usize, sample_cou
         write_register_word(pci, STATUS_PCM_OUT, STATUS_LVBCI_BIT | STATUS_BCIS_BIT | STATUS_FIFOE_BIT)
             .warning_as_error()?;
 
-        // Flush WC writes
+        // Flush WC writes in status register
         pci.flush()
             .warning_as_error()?;
-
-        // Calculate the delay between buffers in 100ns intervals
-        let buffers = unsafe { &mut *device.buffers };
-        let buffer_size = buffers.descriptors[lvi as usize].length;
-        let delay = 4_700_000 * buffer_size as u64 / sampling_rate as u64;
-
-        {
-            let _tpl = unsafe { boot_services().raise_tpl(uefi::table::boot::Tpl::NOTIFY) };
-
-            boot_services()
-                .set_timer(device.timer_event.unwrap(), uefi::table::boot::TimerTrigger::Relative(delay))
-                .warning_as_error()?;
-        }
 
         wait_end_of_transfer(pci)
             .warning_as_error()?;
@@ -661,6 +653,7 @@ fn play_samples(pci: &PciIO, sampling_rate: u32, buffer_count: usize, sample_cou
             .wait_for_event (&mut [device.timer_event.unwrap()])
             .discard_errdata()?;
     }
+
     Ok (().into())
 }
 
@@ -798,7 +791,7 @@ extern "efiapi" fn my_tone(this: &mut SimpleAudioOut, freq: u16, duration: u16) 
 
     info!("my_tone");
 
-    let device : &'static mut DeviceContext = DeviceContext::from_protocol_mut(this)
+    let device = DeviceContext::from_protocol_mut(boot_services(), this)
         .ok_or(uefi::Status::INVALID_PARAMETER.into())?;
 
     let pci = boot_services()
@@ -840,7 +833,7 @@ extern "efiapi" fn my_tone(this: &mut SimpleAudioOut, freq: u16, duration: u16) 
 
         info!("scheduled {} buffers {} samples", buffer_count, sample_count);
 
-        pci.with_proto(|pci| play_samples(pci, sampling_rate, buffer_count, sample_count, &mut *device))
+        pci.with_proto(|pci| play_samples(pci, channel_count, sampling_rate, buffer_count, sample_count, &mut *device))
             .warning_as_error()?;
     }
 
@@ -849,11 +842,16 @@ extern "efiapi" fn my_tone(this: &mut SimpleAudioOut, freq: u16, duration: u16) 
     uefi::Status::SUCCESS
 }
 
+fn milliseconds_to_timer_period(msec: u64) -> u64 {
+    // Number of 100 ns units
+    msec * 10000
+}
+
 extern "efiapi" fn my_feed(this: &mut SimpleAudioOut, sampling_rate: u32, feed: *const u16, feed_count: usize) -> Status {
 
     info!("my_feed");
 
-    let device : &'static mut DeviceContext = DeviceContext::from_protocol_mut(this)
+    let device = DeviceContext::from_protocol_mut(boot_services(), this)
         .ok_or(uefi::Status::INVALID_PARAMETER.into())?;
 
     let pci = boot_services()
@@ -893,7 +891,7 @@ extern "efiapi" fn my_feed(this: &mut SimpleAudioOut, sampling_rate: u32, feed: 
 
         info!("scheduled {} buffers {} samples", buffer_count, sample_count);
 
-        pci.with_proto(|pci| play_samples(pci, sampling_rate, buffer_count, sample_count, &mut *device))
+        pci.with_proto(|pci| play_samples(pci, 2, sampling_rate, buffer_count, sample_count, &mut *device))
             .warning_as_error()?;
     }
 
@@ -905,12 +903,18 @@ extern "efiapi" fn my_feed(this: &mut SimpleAudioOut, sampling_rate: u32, feed: 
 
 extern "efiapi" fn my_reset(this: &mut SimpleAudioOut) -> Status {
     info!("my_reset");
+
     uefi::Status::UNSUPPORTED
 }
 
 //
 // DriverBinding routines
 //
+
+//
+// PCI Vendor ID
+//
+const INTEL: u16 = 0x8086;
 
 extern "efiapi" fn my_supported(this: &DriverBinding, handle: Handle, remaining_path: *mut DevicePath) -> Status {
 
@@ -939,7 +943,23 @@ extern "efiapi" fn my_supported(this: &DriverBinding, handle: Handle, remaining_
             })?;
         let type00 = unsafe { type00.assume_init() };
         info!("vendor: {:#x}, device: {:#x}", type00.vendor_id, type00.device_id);
-        if type00.vendor_id != 0x8086 || type00.device_id != 0x2415 {
+        let supported = {
+            [
+                (INTEL, 0x2415), // Intel 82801AA (ICH) integrated AC'97 Controller
+                (INTEL, 0x2425), // Intel 82801AB (ICH0) integrated AC'97 Controller
+                (INTEL, 0x2445), // Intel 82801BA (ICH2) integrated AC'97 Controller
+                (INTEL, 0x2485), // Intel 82801CA (ICH3) integrated AC'97 Controller
+                (INTEL, 0x24c5), // Intel 82801DB (ICH4) integrated AC'97 Controller
+                (INTEL, 0x24d5), // Intel 82801EB/ER (ICH5/ICH5R) integrated AC'97 Controller
+                (INTEL, 0x25a6), // Intel 6300ESB integrated AC'97 Controller
+                (INTEL, 0x266e), // Intel 82801FB (ICH6) integrated AC'97 Controller
+                (INTEL, 0x27de), // Intel 82801GB (ICH7) integrated AC'97 Controller
+                (INTEL, 0x7195), // Intel 82443MX integrated AC'97 Controller
+            ].iter().any(|&(vid, did)| {
+                type00.vendor_id == vid && type00.device_id == did
+            })
+        };
+        if !supported {
             return uefi::Status::UNSUPPORTED.into();
         }
         Ok(().into())
@@ -968,6 +988,7 @@ extern "efiapi" fn my_start(this: &DriverBinding, handle: Handle, remaining_path
 
     let bt = boot_services();
 
+    // Sync with stop
     let _tpl = unsafe { bt.raise_tpl(uefi::table::boot::Tpl::NOTIFY) };
 
     let pci = bt
@@ -1025,6 +1046,7 @@ extern "efiapi" fn my_stop(this: &DriverBinding, controller: Handle, _num_child_
 
     let bt = boot_services();
 
+    // Sync with start
     let _tpl = unsafe { bt.raise_tpl(uefi::table::boot::Tpl::NOTIFY) };
 
     let audio_out = bt
@@ -1056,7 +1078,7 @@ extern "efiapi" fn my_stop(this: &DriverBinding, controller: Handle, _num_child_
     let audio_out = audio_out.as_proto().get();
 
     // Note that this operation does not consume anything
-    let device : &'static mut DeviceContext = DeviceContext::from_protocol_mut(audio_out)
+    let device = DeviceContext::from_protocol_mut(boot_services(), audio_out)
         .ok_or(uefi::Status::INVALID_PARAMETER.into())?;
 
     let audio_out_ref = unsafe { audio_out.as_ref().unwrap() };
@@ -1154,7 +1176,7 @@ extern "efiapi" fn my_unload(image_handle: Handle) -> Status {
     info!("my_unload -- ok");
 
     // Cleanup allocator and logging facilities
-    dxe::unload(image_handle);
+    efi_dxe::unload(image_handle);
 
     uefi::Status::SUCCESS
 }
@@ -1162,7 +1184,7 @@ extern "efiapi" fn my_unload(image_handle: Handle) -> Status {
 #[entry]
 fn efi_main(handle: uefi::Handle, system_table: SystemTable<Boot>) -> uefi::Status {
 
-    dxe::init(handle, &system_table)
+    efi_dxe::init(handle, &system_table)
         .warning_as_error()?;
 
     info!("efi_main");
@@ -1172,7 +1194,7 @@ fn efi_main(handle: uefi::Handle, system_table: SystemTable<Boot>) -> uefi::Stat
         my_start,
         my_supported,
         my_stop,
-        0xa,
+        0x0,
         handle,
         handle)
     );
