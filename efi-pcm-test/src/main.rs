@@ -9,49 +9,16 @@ extern crate alloc;
 
 extern crate efi_pcm;
 
-// use uefi::prelude::*;
-
 mod connect;
 mod data;
 
-// use data::*;
-
 use uefi::prelude::*;
-// use uefi::proto::pci::PciIO;
 use efi_pcm::SimpleAudioOut;
 
-// fn load_samples() -> uefi::Result {
-//     let bt = unsafe { uefi_services::system_table().as_ref().boot_services() };
-//     let sfs = bt.locate_protocol::<SimpleFileSystem>()
-//         .warning_as_error()?;
-//     // let sfs = sfs.expect("Cannot open `SimpleFileSystem` protocol");
-//     let sfs = unsafe { &mut *sfs.get() };
-//     let mut directory = sfs.open_volume().unwrap().unwrap();
-//     let mut buffer = vec![0; 128];
-//     loop {
-//         let file_info = match directory.read_entry(&mut buffer) {
-//             Ok(completion) => {
-//                 if let Some(info) = completion.unwrap() {
-//                     info
-//                 } else {
-//                     // We've reached the end of the directory
-//                     break;
-//                 }
-//             }
-//             Err(error) => {
-//                 // Buffer is not big enough, allocate a bigger one and try again.
-//                 let min_size = error.data().unwrap();
-//                 buffer.resize(min_size, 0);
-//                 continue;
-//             }
-//         };
-//         info!("Root directory entry: {:?}", file_info);
-//     }
-//     directory.reset_entry_readout().unwrap().unwrap();
-// }
-
 fn test_tone(audio_out: &mut SimpleAudioOut) -> uefi::Result {
-    
+
+    const I: u16 = 250;
+
     const C3: u16 = 130;
     const D3: u16 = 146;
     const D3SHARP: u16 = 155;
@@ -70,57 +37,49 @@ fn test_tone(audio_out: &mut SimpleAudioOut) -> uefi::Result {
     const D5SHARP: u16 = 622;
 
     const SAMPLES: &[(u16, u16)] = &[
-        (C4, 500),
-        (D4, 500),
-        (D4SHARP, 1000),
-        (10, 1000),
-        (D4SHARP, 500),
-        (F4, 500),
-        (G4, 1000),
-        (10, 1000),
-        (G4, 500),
-        (A4SHARP, 500),
-        (F4, 1000),
-        (10, 500),
-        (G4, 250),
-        (F4, 250),
-        (D4SHARP, 500),
-        (D4, 500),
-        (C4, 1000),
-
-        (C4, 500),
-        (D4, 500),
-        (D4SHARP, 1000),
-        (10, 1000),
-        (D4SHARP, 500),
-        (F4, 500),
-        (G4, 1000),
-        (10, 1000),
-        (G4, 500),
-        (A4SHARP, 500),
-        (C5, 1000),
-        (A4SHARP, 1000),
-        (D5, 500),
-        (C5, 500),
-        (10, 1000),
-        
-        (C5, 1000),
-        (D5, 250),
-        (D5SHARP, 1000),
-        (D5, 1000),
-        (C5, 500),
-        (A4SHARP, 500),
-        (G4SHARP, 1000),
-        (G4, 1000),
-        (F4, 1000),
-        (10, 1000),
-        (D4SHARP, 500),
-        (G4, 250),
-        (F4, 1000),
-
-        (D4SHARP, 1000),
-        (D4, 500),
-        (C4, 500),        
+        (C4, I),
+        (D4, I),
+        (D4SHARP, 4*I),
+        (D4SHARP, I),
+        (F4, I),
+        (G4, 4*I),
+        (G4, I),
+        (A4SHARP, I),
+        (F4, 4*I),
+        (G4, I/2),
+        (F4, I/2),
+        (D4SHARP, I),
+        (D4, I),
+        (C4, 4*I),
+        (C4, I),
+        (D4, I),
+        (D4SHARP, 4*I),
+        (D4SHARP, I),
+        (F4, I),
+        (G4, 4*I),
+        (G4, I),
+        (A4SHARP, I),
+        (C5, 4*I),
+        (A4SHARP, 3*I),
+        (D5, I/2),
+        (C5, 4*I),
+        (C5, 3*I),
+        (D5, I/2),
+        (D5SHARP, 2*I),
+        (D5, 2*I),
+        (C5, 2*I),
+        (A4SHARP, I*8/10),
+        (C5, I/10),
+        (A4SHARP, I/10),
+        (G4SHARP, 2*I),
+        (G4, 2*I),
+        (F4, 4*I),
+        (D4SHARP, I),
+        (G4, I),
+        (F4, 4*I),
+        (D4SHARP, I),
+        (D4, I),
+        (C4, 4*I),
     ];
 
     for &(freq, duration) in SAMPLES {
@@ -131,32 +90,37 @@ fn test_tone(audio_out: &mut SimpleAudioOut) -> uefi::Result {
     Ok(().into())
 }
 
+fn test_cracks(audio_out: &mut SimpleAudioOut) -> uefi::Result {
+    let mut freq = 1;
+    loop {
+        audio_out.tone(freq, 250);
+        freq += 10;
+    }
+
+    Ok(().into())
+}
+
 #[entry]
 fn efi_main(_handle: uefi::Handle, system_table: SystemTable<Boot>) -> uefi::Status {
-
     uefi_services::init(&system_table)
         .expect_success("this is only the beginning");
-
     info!("efi_main");
-
     connect::connect_pci_recursively();
-
     connect::enum_simple_audio_out();
-
     info!("efi_main -- ok");
-
     let bt = unsafe { uefi_services::system_table().as_ref().boot_services() };
-
     let audio_out = bt
         .locate_protocol::<SimpleAudioOut>()
         .log_warning()?;
-
     let audio_out = unsafe { &mut *audio_out.get() };
-
-    // let my_data = load_samples()?;
-    audio_out.feed(22100, data::TEST_DATA).log_warning()?;
-
+    let data = unsafe { core::mem::transmute(data::TEST_DATA) };
+    audio_out.write(22050, data)
+        .map_err(|error| {
+            error!("pcm write failed: {:?}", error.status());
+            error
+        })
+        .warning_as_error()?;
     // test_tone(audio_out).warning_as_error()?;
-
+    // test_cracks(audio_out).warning_as_error()?;
     uefi::Status::SUCCESS
 }

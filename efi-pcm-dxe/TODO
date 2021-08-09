@@ -1,22 +1,35 @@
-* TODO look at snd_pcm_writei() from alsa
-* TODO proper sample scheduling with no lost frames
-** in particular proper timer intervals
-* TODO react on ExitBootServices
-* TODO implement reset
-** TODO what exactly should I implement here?
-* TODO extend the API for other PCM formats, sampling rates, channel count and volume
-* TODO implement tone
-** use timers to stop beep
-** BUG sampling rate lesser than 44100 does not work
-** how to emit silence?
-** duration smaller than 500 ms does not work
-* TODO understand how OpenCorePkg represents audio data and audio protocols
-  - BeepGen -- done
-  - PlayTone -- same as BeepGen but for HDA
-  - VoiceOver -- opaque
-* TODO ComponentName and ComponentName2
-* TODO using BOX across FFI is UB
-* TODO link scripts for global objects
+* Top
+** DONE react on ExitBootServices
+*** when notified we must disable all controllers
+** OpenProtocol::with_proto is bullshit
+** PCI memory buffer mapping is duplicated
+* Bottom
+** TODO ComponentName and ComponentName2
+
+** TODO qemu-ac97 + apic + IOC = interrupt not fired; why?
+** TODO port the driver to SMM
+** TODO look at snd_pcm_writei() from alsa
+   - usage code
+     pcm = alsaaudio.PCM(alsaaudio.PCM_PLAYBACK, alsaaudio.PCM_NORMAL)
+     pcm.setrate(44100)
+     pcm.setchannels(2)
+     pcm.setperiodsize(1000)
+     pcm.setformat(alsaaudio.PCM_FORMAT_S16_LE)
+** TODO extend the API for other PCM formats, sampling rates, channel count and volume
+** TODO understand how OpenCorePkg represents audio data and audio protocols
+   - BeepGen -- done
+   - PlayTone -- same as BeepGen but for HDA
+   - VoiceOver -- opaque
+** TODO link scripts for global objects
+* WONTFIX using BOX across FFI is UB
+  - this is not true:
+    - Box<T> is guaranteed to have the same layout as *const T which for T: Sized types is guaranteed t have the same layout as C-lang pointer.
+    - it seems that this also holds for non Sized-marked T-types
+* DONE implement tone
+* DONE amplitude of samples of isine()
+  - [SHORT_MIN..SHORT_MAX] seems reasonable and working good. there was a problem with endianness of data
+* DONE proper sample scheduling with no lost frames
+** DONE in particular proper timer intervals
 * DONE unload crash when exit from shell
   - didn't I fix this?
 * DONE implement feed

@@ -4,11 +4,16 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
+// We are accessing packed structures. Make sure that we
+// don't produce undefined behavior
 #![deny(unaligned_references)]
 
+// TBD: needed to allocate BDL on the heap without creating
+//      it first on the stack and then allocate a heap
+//      structure. Can we do better?
 #![feature(new_uninit)]
 
-// TBD: for static assert
+// TBD: move into another crate (for static assert)
 #![feature(const_panic)]
 
 #[macro_use]
@@ -33,7 +38,6 @@ use uefi::proto::pci::PciIO;
 use uefi::table::boot::OpenAttribute;
 use uefi::table::boot::BootServices;
 
-use core::fmt::{self, Write};
 use core::str;
 use core::fmt::*;
 use core::mem;
@@ -42,13 +46,31 @@ use alloc::boxed::*;
 use efi_dxe::*;
 use efi_pcm::*;
 
-// TBD: this is supposed to be packed even though all registers are naturally aligned in C.
-// Rustc complains that _creating_ unaligned references is UB. What should we do?
+// TBD: move into another crate
+macro_rules! static_assert {
+    ($cond:expr) => {
+        static_assert!($cond, concat!("assertion failed: ", stringify!($cond)));
+    };
+    ($cond:expr, $($t:tt)+) => {
+        #[forbid(const_err)]
+        const _: () = {
+            if !$cond {
+                core::panic!($($t)+)
+            }
+        };
+    };
+}
+
 /// PCI Device Configuration Space
 /// Section 6.1, PCI Local Bus Specification, 2.2
-// #[repr(C, packed)]
+///
+/// Note that this struct is supposed to be packed but rustc
+/// complains about unaligned field access and unaligned
+/// references, but with repr(C) this structure is naturally
+/// aligned so that we will only ensure the proper size
+/// with static_assert().
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct PciType00 {
     vendor_id: u16,
     device_id: u16,
@@ -74,10 +96,18 @@ struct PciType00 {
     max_lat: u8,
 }
 
-// TBD: see comments above
-// #[repr(C, packed)]
+static_assert!(mem::size_of::<PciType00>() == 64);
+
+/// AC'97 baseline audio register set.
+/// Section 5.7, AC'97 specification, r2.3, April 2002.
+///
+/// Note that this struct is supposed to be packed but rustc
+/// complains about unaligned field access and unaligned
+/// references, but with repr(C) this structure is naturally
+/// aligned so that we will only ensure the proper size
+/// with static_assert().
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct BaseRegisterSet {
     reset: u16,
     master_volume: u16,
@@ -108,54 +138,53 @@ struct BaseRegisterSet {
     vendor_id2: u16,
 }
 
-macro_rules! static_assert {
-    ($cond:expr) => {
-        static_assert!($cond, concat!("assertion failed: ", stringify!($cond)));
-    };
-    ($cond:expr, $($t:tt)+) => {
-        #[forbid(const_err)]
-        const _: () = {
-            if !$cond {
-                core::panic!($($t)+)
-            }
-        };
-    };
-}
-
 static_assert!(mem::size_of::<BaseRegisterSet>() == 0x80);
 
-const DESCRIPTOR_IOC_BIT: u16 = 0x8000;
-const DESCRIPTOR_LAST_BIT: u16 = 0x4000;
+//
+// PCI Vendor ID
+//
+const VID_INTEL: u16 = 0x8086;
+
+//
+// Reset bit selfclear timeout in microseconds
+//
+const RESET_TIMEOUT: u64 = 1000;
+
+
+//
+// Buffer Descriptor control flags
+//
+const BDBAR_IOC_BIT: u16 = 0x8000;  // interrupt fired when data from this entry is transferred
+const BDBAR_LAST_BIT: u16 = 0x4000; // last entry of buffer, stop playing
 
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
 struct Descriptor {
     address: u32,               // physical address to sound data
-    length: u16,                // length of sound data -1
-    control: u16,               // bit 15: interrupt fired when data from this entry is transferred
-                                // bit 14: last entry of buffer, stop playing
-                                // other bits: reserved
+    length: u16,                // sample count
+    control: u16
 }
 
-const BUFFER_SIZE: usize = 1 << 15;
+const BUFFER_SIZE: usize = 1 << 16;
 const BUFFER_COUNT: usize = 32;
 
-// For ICH7 max number of buffers is 32. The data should be
+// For ICH5 max number of buffers is 32. The data should be
 // aligned on 8-byte boundaries. Each buffer descriptor is 8
 // bytes long and the list can contain a maximum of 32
-// entries.
-// TBD: -- supposed to be packed but pointers
-// might become unaligned as produced by Box::new
-// #[repr(C, packed)]
+// entries. Empty buffers are allowed but not first and not
+// last. Number of samples must be multiple of channel
+// count. Left channel is always assumed to be first and
+// right channel is assumed to be the last.
 #[repr(C, align(8))]
 #[derive(Copy, Clone)]
-struct Buffers {
+struct BufferDescriptorListWithBuffers {
     descriptors: [Descriptor; BUFFER_COUNT],
-    pointers: [*const i16; BUFFER_COUNT],
     buffers: [[i16; BUFFER_SIZE]; BUFFER_COUNT]
 }
 
+//
 // Mixer registers
+//
 const MIXER_RESET: u64        = 0x00; // reset
 const MIXER_MASTER: u64       = 0x02; // master volume
 const MIXER_PCM_OUT: u64      = 0x18; // PCM OUT volume
@@ -164,28 +193,18 @@ const PCM_RATE_SURROUND: u64  = 0x2E; // PCM surround channel DAC sample rate
 const PCM_RATE_LFE: u64       = 0x30; // PCM LFE channel DAC sample rate
 
 //
-// Bus Master registers
+// Bus Master PCM OUT NAMB
 //
-const DESCRIPTOR_PCM_OUT: u64 = 0x10; // PCM OUT descriptor base address
-const CIV_PCM_OUT: u64        = 0x14; // PCM OUT current index value
-const LVI_PCM_OUT: u64        = 0x15; // PCM OUT last valid index
-const STATUS_PCM_OUT: u64     = 0x16; // PCM OUT status
-const SAMPLES_PCM_OUT: u64    = 0x18; // PCM OUT number of transferred samples
-const PROCESSED_PCM_OUT: u64  = 0x1A; // PCM OUT processed entry
-const CONTROL_PCM_OUT: u64    = 0x1B; // PCM OUT control
-const GLOBAL_CONTROL: u64     = 0x2C; // global control
-const GLOBAL_STATUS: u64      = 0x30; // global status
-
-#[repr(C, packed)]
-struct NativeAudioMixerBaseRegisterBox {
-    buffer_dsc_addr: u32,       // physical address of buffer descriptor list
-    cur_entry_val: u8,          // number of actual processed buffer descriptor entry
-    last_valid_entry: u8,       // number of all descriptor entries
-    transfer_sts: u16,          // status of transferring data
-    cur_idx_proc_samples: u16,  // number of transferred samples in actual processed entry
-    prcsd_entry: u8,            // number of actual processed buffer entry
-    buffer_cnt: u8,             // most important register for controlling transfers
-}
+const BDBAR_PCM_OUT: u64      = 0x10; // Buffer Descriptor List Base Address
+const CIV_PCM_OUT: u64        = 0x14; // Current index value, number of actual processed buffers
+const LVI_PCM_OUT: u64        = 0x15; // Last valid index
+const STATUS_PCM_OUT: u64     = 0x16; // Transfer status
+const PICB_PCM_OUT: u64       = 0x18; // Position in current buffer
+const PIV_PCM_OUT: u64        = 0x1A; // Prefetched index value
+const CONTROL_PCM_OUT: u64    = 0x1B; // Transfer Control
+const GLOBAL_CONTROL: u64     = 0x2C; // Global Control
+const GLOBAL_STATUS: u64      = 0x30; // Global Status
+const CAS: u64                = 0x34; // Codec Access Semaphore register (ICH7)
 
 //
 // PCM OUT capability bits
@@ -198,20 +217,20 @@ const CHANNELS_R: u8 = 0b11;                             // reserved
 //
 // PCM OUT Buffer control register bits
 //
-const CONTROL_DMA_BIT: u8   = 0x1;                                     // 0=Pause transferring 1=Transfer sound data
-const CONTROL_RESET_BIT: u8 = 0x2;                                     // 0=Remove reset condition 1=Reset this NABM register box, this bit is selfcleared
-const CONTROL_LVBCI_BIT: u8 = 0x4;                                     // 0=Disable interrupt 1=Enable interrupt
-const CONTROL_BCIS_BIT: u8  = 0x8;                                     // 0=Disable interrupt 1=Enable interrupt
-const CONTROL_FIFOE_BIT: u8 = 0x10;                                    // 0=Disable interrupt 1=Enable interrupt
+const CONTROL_DMA_BIT: u8   = 0x1;        // 0 to pause transferring, 1 to start transferring
+const CONTROL_RESET_BIT: u8 = 0x2;        // 1 reset this NABM, cleared by DMA engine
+const CONTROL_LVBCI_BIT: u8 = 0x4;        // 0 to disable this interrupt, 1 to enable
+const CONTROL_BCIS_BIT: u8  = 0x8;        // 0 to disable this interrupt, 1 to enable
+const CONTROL_FIFOE_BIT: u8 = 0x10;       // 0 to disable this interrupt, 1 to enable
 
 //
 // PCM OUT Transfer status register bits
 //
-const STATUS_DCH_BIT: u16   = 0x1;                                     // dma controller halted
-const STATUS_CELV_BIT: u16  = 0x2;                                     // current equals last valid
-const STATUS_LVBCI_BIT: u16 = 0x4;                                     // last valid buffer completion interrupt
-const STATUS_BCIS_BIT: u16  = 0x8;                                     // buffer completion interrupt
-const STATUS_FIFOE_BIT: u16 = 0x10;                                    // fifo error
+const STATUS_DCH_BIT: u16   = 0x1;        // dma controller halted
+const STATUS_CELV_BIT: u16  = 0x2;        // current equals last valid
+const STATUS_LVBCI_BIT: u16 = 0x4;        // last valid buffer completion interrupt
+const STATUS_BCIS_BIT: u16  = 0x8;        // buffer completion interrupt
+const STATUS_FIFOE_BIT: u16 = 0x10;       // fifo error
 
 struct EventGuard (uefi::Event);
 
@@ -233,29 +252,68 @@ impl Drop for EventGuard {
     }
 }
 
+
+struct PciMappingGuard<'a> {
+    pci: &'a PciIO,
+    mapping: Option<uefi::proto::pci::Mapping>
+}
+
+impl<'a> PciMappingGuard<'a> {
+    fn wrap(pci: &'a PciIO, mapping: uefi::proto::pci::Mapping) -> PciMappingGuard<'a> {
+        PciMappingGuard {
+            pci,
+            mapping: Some(mapping)
+        }
+    }
+
+    fn unwrap(&self) -> &uefi::proto::pci::Mapping {
+        self.mapping.as_ref().unwrap()
+    }
+}
+
+impl<'a> Drop for PciMappingGuard<'a> {
+    fn drop(&mut self) {
+        let mapping = self.mapping.take().unwrap();
+        self.pci
+            .unmap(mapping)
+            .discard_errdata()                           // discard mapping even if failed to unmap
+            .map_err(|error| {
+                error!("unmap operation failed: {:?}", error.status());
+                error
+            })
+            .warning_as_error()
+            .or::<()>(Ok(().into()))                     // never fail
+            .unwrap();
+    }
+}
+
 const DEVICE_CONTEXT_SIGNATURE: u64 = 0x74_75_6f_6f_69_64_75_61; // "audioout"
 
 struct DeviceContext {
     signature: u64,
     handle: Handle,
     driver_handle: Handle,                               // TBD: -- get rid of this
-    mapping: uefi::proto::pci::Mapping,
-    for_plebs: SimpleAudioOut,
-    timer_event: EventGuard,
-    tone_event: EventGuard,
-    buffers: *mut Buffers,
+    audio_interface: SimpleAudioOut,
+    picb_event: EventGuard,
+    playback_event: EventGuard,
+    bdl: Box<BufferDescriptorListWithBuffers>,
 }
 
 impl DeviceContext {
     // BootServices reference is only needed to inherit its lifetime
     fn from_protocol<'a>(_bs: &'a uefi::table::boot::BootServices, raw: *const SimpleAudioOut) -> Option<&'a DeviceContext> {
         use memoffset::offset_of;
-        let offset_bytes = memoffset::offset_of!(DeviceContext, for_plebs);
+        let offset_bytes = memoffset::offset_of!(DeviceContext, audio_interface);
+        // TBD: reinterpret cast to DeviceContext creates
+        //      unaligned pointers. Should I peek an 8 byte
+        //      string and compare it with the signature?
+        // SAFETY: TBD
         let context: *const DeviceContext = unsafe {
             (raw as *const u8)
                 .sub(offset_bytes).cast()
         };
         if (context as *const u8 as usize) % mem::align_of::<DeviceContext>() == 0 {
+            // SAFETY: TBD
             let context = unsafe { &*context };
             if context.signature == DEVICE_CONTEXT_SIGNATURE {
                 return Some(context);
@@ -267,12 +325,17 @@ impl DeviceContext {
     // BootServices reference is only needed to inhert its lifetime
     fn from_protocol_mut<'a>(_bs: &'a uefi::table::boot::BootServices, raw: *mut SimpleAudioOut) -> Option<&'a mut DeviceContext> {
         use memoffset::offset_of;
-        let offset_bytes = memoffset::offset_of!(DeviceContext, for_plebs);
+        let offset_bytes = memoffset::offset_of!(DeviceContext, audio_interface);
+        // TBD: reinterpret cast to DeviceContext creates
+        //      unaligned pointers. Should I peek an 8 byte
+        //      string and compare it with the signature?
+        // SAFETY: TBD
         let context: *mut DeviceContext = unsafe {
             (raw as *mut u8)
                 .sub(offset_bytes).cast()
         };
         if (context as *mut u8 as usize) % mem::align_of::<DeviceContext>() == 0 {
+            // SAFETY: TBD
             let context = unsafe { &mut *context };
             if context.signature == DEVICE_CONTEXT_SIGNATURE {
                 return Some(context);
@@ -282,22 +345,23 @@ impl DeviceContext {
     }
 }
 
-fn init_buffers(mapping: &uefi::proto::pci::Mapping, buffers: &mut Buffers) {
-    let buffers_base = buffers as *mut Buffers as *mut u8;
-    for ((descriptor, ptr), buffer) in buffers.descriptors.iter_mut().zip(buffers.pointers.iter_mut()).zip(buffers.buffers.iter()) {
-        // TBD: -- I presume that this is UB because:
-        //  1) Pointers are not derived from the same type
-        //  2) not the same allocated(?) object
+fn init_bdl(mapping: &uefi::proto::pci::Mapping, bdl: &mut BufferDescriptorListWithBuffers) {
+    let bdl_base = bdl as *mut BufferDescriptorListWithBuffers as *mut u8;
+    for (descriptor, buffer) in bdl.descriptors.iter_mut().zip(bdl.buffers.iter()) {
+        // TBD: -- I presume that this is UB because pointers are not derived from the same type
+        // SAFETY: see dma-buffer miri test #1
         let buffer_offset = unsafe {
             (buffer.as_ptr() as *const u8)
-                .offset_from(buffers_base)
+                .offset_from(bdl_base)
         };
-        *ptr = buffer.as_ptr();
-        // TBD: -- same as above
+        // TBD: UB if mapping address or bdl_base is not a valid pointer
+        // SAFETY: TBD
         let descriptor_address = unsafe {
             (mapping.device_address() as *const u8)
                 .offset(buffer_offset)
         };
+        // TBD: descriptor is packed and we are accessing
+        //      unaligned fields via reference -- this is UB
         descriptor.address = descriptor_address as u32;
         descriptor.length = 0;
         descriptor.control = 0;
@@ -306,40 +370,34 @@ fn init_buffers(mapping: &uefi::proto::pci::Mapping, buffers: &mut Buffers) {
 
 fn read_register_byte(pci: &PciIO, offset: u64) -> uefi::Result<u8, ()> {
     let value = &mut [0];
-    pci.read_io::<u8>(uefi::proto::pci::IoRegister::R1, offset, value)
-        .warning_as_error()?;
+    pci.read_io::<u8>(uefi::proto::pci::IoRegister::R1, offset, value)?;
     Ok(value[0].into())
 }
 
 fn read_register_word(pci: &PciIO, offset: u64) -> uefi::Result<u16, ()> {
     let value = &mut [0];
-    pci.read_io::<u16>(uefi::proto::pci::IoRegister::R1, offset, value)
-        .warning_as_error()?;
+    pci.read_io::<u16>(uefi::proto::pci::IoRegister::R1, offset, value)?;
     Ok(value[0].into())
 }
 
 fn read_register_dword(pci: &PciIO, offset: u64) -> uefi::Result<u32, ()> {
     let value = &mut [0];
-    pci.read_io::<u32>(uefi::proto::pci::IoRegister::R1, offset, value)
-        .warning_as_error()?;
+    pci.read_io::<u32>(uefi::proto::pci::IoRegister::R1, offset, value)?;
     Ok(value[0].into())
 }
 
 fn write_register_byte(pci: &PciIO, offset: u64, value: u8) -> uefi::Result {
-    pci.write_io::<u8>(uefi::proto::pci::IoRegister::R1, offset, &[value])
-        .warning_as_error()?;
+    pci.write_io::<u8>(uefi::proto::pci::IoRegister::R1, offset, &[value])?;
     Ok(().into())
 }
 
 fn write_register_word(pci: &PciIO, offset: u64, value: u16) -> uefi::Result {
-    pci.write_io::<u16>(uefi::proto::pci::IoRegister::R1, offset, &[value])
-        .warning_as_error()?;
+    pci.write_io::<u16>(uefi::proto::pci::IoRegister::R1, offset, &[value])?;
     Ok(().into())
 }
 
 fn write_register_dword(pci: &PciIO, offset: u64, value: u32) -> uefi::Result {
-    pci.write_io::<u32>(uefi::proto::pci::IoRegister::R1, offset, &[value])
-        .warning_as_error()?;
+    pci.write_io::<u32>(uefi::proto::pci::IoRegister::R1, offset, &[value])?;
     Ok(().into())
 }
 
@@ -352,29 +410,24 @@ fn stereo_volume(left: u16, right: u16, mute: bool) -> u16 {
 }
 
 fn write_mixer_master_register(pci: &PciIO, value: u16) -> uefi::Result {
-    pci.write_io::<u16>(uefi::proto::pci::IoRegister::R0, MIXER_MASTER, &[value])
-        .warning_as_error()?;
+    pci.write_io::<u16>(uefi::proto::pci::IoRegister::R0, MIXER_MASTER, &[value])?;
     Ok(().into())
 }
 
 fn read_mixer_master_register(pci: &PciIO) -> uefi::Result<u16, ()> {
-    // Basically uninit.
     let value = &mut [0];
-    pci.read_io::<u16>(uefi::proto::pci::IoRegister::R0, MIXER_MASTER, value)
-        .warning_as_error()?;
+    pci.read_io::<u16>(uefi::proto::pci::IoRegister::R0, MIXER_MASTER, value)?;
     Ok(value[0].into())
 }
 
 fn write_mixer_pcm_out_register(pci: &PciIO, value: u16) -> uefi::Result {
-    pci.write_io::<u16>(uefi::proto::pci::IoRegister::R0, MIXER_PCM_OUT, &[value])
-        .warning_as_error()?;
+    pci.write_io::<u16>(uefi::proto::pci::IoRegister::R0, MIXER_PCM_OUT, &[value])?;
     Ok(().into())
 }
 
 fn probe_master_volume(pci: &PciIO) -> uefi::Result<u16, ()> {
     let probe_value = stereo_volume(0x20, 0x20, true);
-    write_mixer_master_register(pci, probe_value)
-        .warning_as_error()?;
+    write_mixer_master_register(pci, probe_value)?;
     // If AC ‘97 only supports 5 bits of resolution in its
     // mixer and the driver writes a 1xxxxx, then AC ‘97
     // must interpret that as x11111. It will also respond
@@ -384,25 +437,30 @@ fn probe_master_volume(pci: &PciIO) -> uefi::Result<u16, ()> {
     if probe_value == probe_result {
         Ok(0b11111.into())
     } else {
-        Ok(0b01111.into())
+        Ok(0b1111.into())
     }
 }
 
 fn set_sampling_rate(pci: &PciIO, sampling_rate: u16) -> uefi::Result {
-    pci.write_io::<u16>(uefi::proto::pci::IoRegister::R0, PCM_RATE_FRONT, &[sampling_rate])
-        .warning_as_error()?;
-    pci.write_io::<u16>(uefi::proto::pci::IoRegister::R0, PCM_RATE_SURROUND, &[sampling_rate])
-        .warning_as_error()?;
-    pci.write_io::<u16>(uefi::proto::pci::IoRegister::R0, PCM_RATE_LFE, &[sampling_rate])
-        .warning_as_error()?;
+    if sampling_rate != 8000 &&
+        sampling_rate != 11025 &&
+        sampling_rate != 16000 &&
+        sampling_rate != 22050 &&
+        sampling_rate != 32000 &&
+        sampling_rate != 44100 &&
+        sampling_rate != 48000
+    {
+        return uefi::Status::INVALID_PARAMETER.into()
+    }
+    pci.write_io::<u16>(uefi::proto::pci::IoRegister::R0, PCM_RATE_FRONT, &[sampling_rate])?;
+    pci.write_io::<u16>(uefi::proto::pci::IoRegister::R0, PCM_RATE_SURROUND, &[sampling_rate])?;
+    pci.write_io::<u16>(uefi::proto::pci::IoRegister::R0, PCM_RATE_LFE, &[sampling_rate])?;
     Ok(().into())
 }
 
 fn set_master_volume(pci: &PciIO, volume: u16) -> uefi::Result {
-    write_mixer_master_register(pci, volume)
-        .warning_as_error()?;
-    write_mixer_pcm_out_register(pci, volume)
-        .warning_as_error()?;
+    write_mixer_master_register(pci, volume)?;
+    write_mixer_pcm_out_register(pci, volume)?;
     Ok(().into())
 }
 
@@ -431,40 +489,80 @@ fn set_channel_count(pci: &PciIO, channels: u8) -> uefi::Result {
 }
 
 fn dump_pcm_out_registers(pci: &PciIO) -> uefi::Result {
-    let buffer_dsc_addr = read_register_dword(pci, DESCRIPTOR_PCM_OUT)
+    let bdbar = read_register_dword(pci, BDBAR_PCM_OUT)
         .warning_as_error()?;
     let civ = read_register_byte(pci, CIV_PCM_OUT)
         .warning_as_error()?;
     let lvi = read_register_byte(pci, LVI_PCM_OUT)
         .warning_as_error()?;
-    let transfer_sts = read_register_word(pci, STATUS_PCM_OUT)
+    let status = read_register_word(pci, STATUS_PCM_OUT)
         .warning_as_error()?;
-    let cur_idx_proc_samples = read_register_byte(pci, SAMPLES_PCM_OUT)
+    let picb = read_register_word(pci, PICB_PCM_OUT)
         .warning_as_error()?;
-    let prcsd_entry = read_register_byte(pci, PROCESSED_PCM_OUT)
+    let piv = read_register_byte(pci, PIV_PCM_OUT)
         .warning_as_error()?;
-    let buffer_cnt = read_register_byte(pci, CONTROL_PCM_OUT)
+    let control = read_register_byte(pci, CONTROL_PCM_OUT)
         .warning_as_error()?;
-    info!("addr {:x}, civ {}, lvi {}, sts {:x}, samples {}, prcsd {}, cnt {:x}",
-          buffer_dsc_addr, civ, lvi, transfer_sts, cur_idx_proc_samples, prcsd_entry, buffer_cnt);
+    info!("bdbar 0x{:x}, civ {}, lvi {}, sts 0x{:x}, picb {}, piv {}, control 0x{:x}",
+          bdbar, civ, lvi, status, picb, piv, control);
     Ok(().into())
 }
 
 fn dump_global_bar1_registers(pci: &PciIO) -> uefi::Result {
     let global_sts = read_register_dword(pci, GLOBAL_STATUS)
         .map_err(|error| {
-            error!("read_register_dword GLOBAL_STS failed: {:?}", error.status());
+            error!("read_register_dword GLOBAL_STATUS failed: {:?}", error.status());
             error
         })
         .warning_as_error()?;
     let global_ctl = read_register_dword(pci, GLOBAL_CONTROL)
         .map_err(|error| {
-            error!("read_register_dword GLOBAL_CTL failed: {:?}", error.status());
+            error!("read_register_dword GLOBAL_CONTROL failed: {:?}", error.status());
             error
         })
         .warning_as_error()?;
     info!("GLOBAL_CONTROL = 0x{:x}, GLOBAL_STATUS = 0x{:x}", global_ctl, global_sts);
     Ok(().into())
+}
+
+fn wait_word(pci: &PciIO, offset: u64, mask: u16, value: u16) -> uefi::Result {
+    info!("wait word");
+    loop {
+        dump_pcm_out_registers(pci);
+        let register = read_register_word(pci, offset)
+            .map_err(|error| {
+                error!("read_register_word {:x} failed: {:?}", offset, error.status());
+                error
+            })
+            .warning_as_error()?;
+        if (register & mask) == value {
+            info!("wait word -- success");
+            return Ok(().into());
+        }
+        boot_services().stall(20);
+    }
+}
+
+fn wait_byte(pci: &PciIO, timeout: u64, offset: u64, mask: u8, value: u8) -> uefi::Result {
+    info!("wait byte");
+    let mut time = 0;
+    loop {
+        let register = read_register_byte(pci, offset)
+            .map_err(|error| {
+                error!("read_register_byte {:x} failed: {:?}", offset, error.status());
+                error
+            })
+            .warning_as_error()?;
+        if (register & mask) == value {
+            info!("wait byte -- success");
+            return Ok(().into());
+        }
+        boot_services().stall(20);
+        time += 20;
+        if time >= timeout {
+            return Err (uefi::Status::TIMEOUT.into());
+        }
+    }
 }
 
 fn wait_end_of_transfer(pci: &PciIO) -> uefi::Result {
@@ -483,123 +581,67 @@ fn wait_end_of_transfer(pci: &PciIO) -> uefi::Result {
     }
 }
 
-fn init_audio_codec(driver_handle: Handle, handle: Handle, pci: &PciIO) -> uefi::Result<Box<DeviceContext>> {
-    // Nice yet unstable feature
-    // let mut buffer = Box::<Buffers>::new_zeroed();
-
+fn init_device_context(driver_handle: Handle, handle: Handle, pci: &PciIO) -> uefi::Result<Box<DeviceContext>> {
+    //
     // Careful now, we might be doing a bad thing creating
     // unaligned pointers inside the struct like this.
     // Also, allocating big structure must be made entirely
     // on the heap.
-
-    let mut buffers = Box::<Buffers>::new_uninit();
-    let buffers_ptr = buffers.as_mut_ptr().cast();
-
-    let bt = boot_services();
-
-    let timer_event = unsafe {
-        bt
-            .create_event(
-                uefi::table::boot::EventType::TIMER,
-                uefi::table::boot::Tpl::NOTIFY,
-                None
-            )
-            .map(|completion| {
-                let (status, result) = completion.split();
-                info!("create timer event returned {:?}", status);
-                result
-            })
-            .map_err(|error| {
-                error!("failed to create event: {:?}", error.status());
-                error
-            })?
-    };
-
+    let mut bdl = Box::<BufferDescriptorListWithBuffers>::new_uninit();
+    let picb_event = boot_services()
+        .create_timer_event()
+        .warning_as_error()?;
     //
     // Wrap the handle so that it won't get leaked
     //
-    let timer_event = EventGuard::wrap(timer_event);
-
-    let tone_event = unsafe {
-        bt
-            .create_event(
-                uefi::table::boot::EventType::TIMER,
-                uefi::table::boot::Tpl::NOTIFY,
-                None
-            )
-            .map(|completion| {
-                let (status, result) = completion.split();
-                info!("create tone event returned {:?}", status);
-                result
-            })
-            .map_err(|error| {
-                error!("failed to create tone event: {:?}", error.status());
-                error
-            })?
-    };
-
-    let tone_event = EventGuard::wrap(tone_event);
-
-    let mapping = pci
-        .map(uefi::proto::pci::IoOperation::BusMasterWrite, buffers_ptr, mem::size_of::<Buffers>())
-        .map(|completion| {
-            let (status, result) = completion.split();
-            info!("map operation: {:?}", status);
-            result
-        })
-        .map_err(|error| {
-            error!("map operation failed: {:?}", error.status());
-            error
-        })?;
-
-    let mut buffers = Box::into_raw(unsafe { buffers.assume_init() });
-
-    init_buffers(&mapping, unsafe { &mut *buffers });
-
+    let picb_event = EventGuard::wrap(picb_event);
+    let playback_event = boot_services()
+        .create_timer_event()
+        .warning_as_error()?;
+    let playback_event = EventGuard::wrap(playback_event);
+    // TBD: isn't it possible for this pointer to BDL to change
+    //      after the further down Box::into_raw invocation?
+    // SAFETY: see dma-buffer miri test #1
+    let mut bdl = unsafe { bdl.assume_init() };
     let device = Box::new(DeviceContext {
         signature: DEVICE_CONTEXT_SIGNATURE,
         handle,
         driver_handle,
-        mapping,
-        timer_event,
-        tone_event,
-        buffers,
-        for_plebs: SimpleAudioOut {
-            reset: my_reset,
-            feed: my_feed,
-            tone: my_tone,
+        picb_event,
+        playback_event,
+        bdl,
+        audio_interface: SimpleAudioOut {
+            reset: 0,
+            write: pcm_write,
+            tone: pcm_tone,
+            set_mode: 0,
+            query_mode: 0,
+            max_mode: 0,
+            mode: 0,
+            capabilities: 0
         }
     });
-
     Ok (device.into())
 }
 
 fn init_playback(pci: &PciIO, sampling_rate: u32, device: &mut DeviceContext) -> uefi::Result {
-
     let max_master_volume = probe_master_volume(pci)
         .warning_as_error()?;
-
     info!("max master volume: {:#?}", max_master_volume);
-
-    // TBD: what should we do with unsupported values?
-    set_sampling_rate(pci, sampling_rate as u16)
-        .warning_as_error()?;
-
-    // Commented because even mono (reported by aplay) seems to work
-    // set_channel_count(pci, CHANNELS_2)
-    //     .expect_success("set channel count failed");
-
-    set_master_volume(pci, stereo_volume(0, 0, false))
-        .warning_as_error()?;
-
-    pci.flush()
-        .warning_as_error()?;
-
+    set_sampling_rate(pci, sampling_rate as u16)?;
+    set_channel_count(pci, CHANNELS_2)?;
+    set_master_volume(pci, stereo_volume(0, 0, false))?;
+    pci.flush()?;
     Ok (().into())
 }
 
-fn play_samples(pci: &PciIO, channel_count: u16, sampling_rate: u32, buffer_count: usize, sample_count: usize, device: &mut DeviceContext) -> uefi::Result {
+fn stop_playback(pci: &PciIO) -> uefi::Result {
+    write_register_byte(pci, CONTROL_PCM_OUT, CONTROL_RESET_BIT)?;
+    wait_byte(pci, RESET_TIMEOUT, CONTROL_PCM_OUT, CONTROL_RESET_BIT, 0)?;
+    Ok (().into())
+}
 
+fn loop_samples(pci: &PciIO, samples: &[i16], channel_count: u16, sampling_rate: u32, duration: u64, device: &mut DeviceContext) -> uefi::Result {
     // Disable interrupts in PCM OUT transfer control register and
     // set Reset Registers (RR) bit
     //
@@ -612,113 +654,212 @@ fn play_samples(pci: &PciIO, channel_count: u16, sampling_rate: u32, buffer_coun
     // it when the Run bit is set will cause undefined
     // consequences
     //
-    // 0b00010
-    write_register_byte(pci, CONTROL_PCM_OUT, CONTROL_RESET_BIT)
+    // 1. Reset control register byte
+    // 2. Set descriptor buffer address
+    // 3. set LVI to max number of valid buffers
+    // 4. for each valid buffer
+    // 4.1. set 0x1 in control register byte
+    // 4.2. poll reset bit =0 in control register byte
+    // 4.3. wait for playback to finish
+    //
+    let mapping = pci
+        .map(
+            uefi::proto::pci::IoOperation::BusMasterWrite,
+            &mut *device.bdl as *mut BufferDescriptorListWithBuffers as *mut _,
+            mem::size_of::<BufferDescriptorListWithBuffers>())
+        .map_err(|error| {
+            error!("map operation failed: {:?}", error.status());
+            error
+        })
         .warning_as_error()?;
-
-    // Write pointer to buffer descriptor list
-    write_register_dword(pci, DESCRIPTOR_PCM_OUT, device.mapping.device_address() as u32)
-        .warning_as_error()?;
-
-    // Set Last Valid Index register with number of valid buffers
-    write_register_byte(pci, LVI_PCM_OUT, (buffer_count - 1) as u8)
-        .warning_as_error()?;
-
-    for lvi in 0..buffer_count as u8 {
-        // Calculate the delay between buffers in 100ns intervals
-        let buffers = unsafe { &mut *device.buffers };
-        let buffer_size = buffers.descriptors[lvi as usize].length;
-        let delay = milliseconds_to_timer_period(1000 * buffer_size as u64 / channel_count as u64 / sampling_rate as u64);
-
-        boot_services()
-            .set_timer(device.timer_event.unwrap(), uefi::table::boot::TimerTrigger::Relative(delay))
-            .warning_as_error()?;
-
-        // Set bit for transferring data in transfer control register (bit 0) - 0x15 (0b10101)
-        write_register_byte(pci, CONTROL_PCM_OUT, CONTROL_DMA_BIT | CONTROL_LVBCI_BIT | CONTROL_FIFOE_BIT)
-            .warning_as_error()?;
-
-        // Clear status register by writing 0x1c (0b11100)
-        write_register_word(pci, STATUS_PCM_OUT, STATUS_LVBCI_BIT | STATUS_BCIS_BIT | STATUS_FIFOE_BIT)
-            .warning_as_error()?;
-
-        // Flush WC writes in status register
-        pci.flush()
-            .warning_as_error()?;
-
-        wait_end_of_transfer(pci)
-            .warning_as_error()?;
-
-        let _ = boot_services()
-            .wait_for_event (&mut [device.timer_event.unwrap()])
+    // Drop will unmap the memory buffer for us
+    let mapping = PciMappingGuard::wrap(pci, mapping);
+    // TBD: creating reference to uninitialized object to
+    //      initialize it is UB, but see miri dma-buffer test #3
+    init_bdl(&mapping.unwrap(), &mut device.bdl);
+    let bdl = &mut device.bdl;
+    copy_samples_to_buffer(bdl, 0, 0, samples);
+    copy_samples_to_buffer(bdl, 1, 0, samples);
+    // Reset PCM OUT register box and wait for the chip to clear the bit
+    write_register_byte(pci, CONTROL_PCM_OUT, CONTROL_RESET_BIT)?;
+    // TBD: add timeout and check return status
+    wait_byte(pci, RESET_TIMEOUT, CONTROL_PCM_OUT, CONTROL_RESET_BIT, 0)?;
+    // Write descriptor list address and its size to respective registers
+    write_register_dword(pci, BDBAR_PCM_OUT, mapping.unwrap().device_address() as u32)?;
+    write_register_byte(pci, LVI_PCM_OUT, 1)?;
+    // We use a timer event to stop the playback
+    let playback_time = milliseconds_to_timer_period(duration);
+    boot_services()
+        .set_timer(
+            device.playback_event.unwrap(),
+            uefi::table::boot::TimerTrigger::Relative(playback_time))?;
+    let delay = milliseconds_to_timer_period(1000 * samples.len() as u64 / channel_count as u64 / sampling_rate as u64);
+    boot_services()
+        .set_timer(
+            device.picb_event.unwrap(),
+            uefi::table::boot::TimerTrigger::Periodic(delay))?;
+    loop {
+        dump_pcm_out_registers(pci);
+        let picb = read_register_word(pci, PICB_PCM_OUT).warning_as_error()?;
+        let civ = read_register_byte(pci, CIV_PCM_OUT).warning_as_error()?;
+        if picb < channel_count {
+            if civ >= 1 {
+                write_register_byte(pci, CONTROL_PCM_OUT, CONTROL_RESET_BIT)?;
+                wait_byte(pci, RESET_TIMEOUT, CONTROL_PCM_OUT, CONTROL_RESET_BIT, 0)?;
+                write_register_dword(pci, BDBAR_PCM_OUT, mapping.unwrap().device_address() as u32)?;
+                write_register_byte(pci, LVI_PCM_OUT, 1)?;
+            }
+            write_register_byte(pci, CONTROL_PCM_OUT, CONTROL_DMA_BIT);
+        }
+        // Playback event must be placed first so that it
+        // would be checked first
+        let index = boot_services()
+            .wait_for_event (&mut [device.playback_event.unwrap(), device.picb_event.unwrap()])
             .discard_errdata()?;
+        if index.unwrap() == 0 {
+            break;
+        }
     }
-
+    info!("loop_samples -- done");
     Ok (().into())
 }
 
-fn deinit_audio_codec(pci: &PciIO, mapping: uefi::proto::pci::Mapping) -> uefi::Result {
-    pci.unmap(mapping)
-        .discard_errdata()                               // discard mapping even if failed to unmap
-        .map(|completion| {
-            let (status, result) = completion.split();
-            info!("unmap operation: {:?}", status);
-            result
-        })
+fn play_samples(pci: &PciIO, samples: &[i16], channel_count: u16, sampling_rate: u32, device: &mut DeviceContext) -> uefi::Result {
+    let mut total_offset = 0;
+    let mut total_sample_count = samples.len();
+    let mapping = pci
+        .map(
+            uefi::proto::pci::IoOperation::BusMasterWrite,
+            &mut *device.bdl as *mut BufferDescriptorListWithBuffers as *mut _,
+            mem::size_of::<BufferDescriptorListWithBuffers>())
         .map_err(|error| {
-            error!("unmap operation failed: {:?}", error.status());
+            error!("map operation failed: {:?}", error.status());
             error
-        })?;
-
-    Ok(().into())
+        })
+        .warning_as_error()?;
+    // Drop will unmap the memory buffer for us
+    let mapping = PciMappingGuard::wrap(pci, mapping);
+    // TBD: creating reference to uninitialized object to
+    //      initialize it is UB, but see miri dma-buffer test #3
+    init_bdl(&mapping.unwrap(), &mut device.bdl);
+    // Reset CIV and PICB. If necessary, prefill must
+    // happend before BDL is set and reset condition is
+    // cleared
+    let bdl = &mut device.bdl;
+    write_register_byte(pci, CONTROL_PCM_OUT, CONTROL_RESET_BIT)?;
+    wait_byte(pci, RESET_TIMEOUT, CONTROL_PCM_OUT, CONTROL_RESET_BIT, 0)?;
+    write_register_dword(pci, BDBAR_PCM_OUT, mapping.unwrap().device_address() as u32)?;
+    let playback_time = milliseconds_to_timer_period(1000 * samples.len() as u64 / channel_count as u64 / sampling_rate as u64);
+    boot_services()
+        .set_timer(
+            device.playback_event.unwrap(),
+            uefi::table::boot::TimerTrigger::Relative(playback_time))?;
+    // Set periodic timer to wait until BUFFER_SIZE samples
+    // are transferred. For each chunk of BUFFER_SIZE
+    // samples there is a DMA transfer going on. The
+    // duration is choosen based on assumestion that all but
+    // last buffer must be fill completely. The last buffer
+    // transfer will be interrupted by playback event.
+    // TBD: Relative timer would be better because it does not
+    //      suffer from biasing.
+    let delay = milliseconds_to_timer_period(1000 * BUFFER_SIZE as u64 / channel_count as u64 / sampling_rate as u64);
+    boot_services()
+        .set_timer(
+            device.picb_event.unwrap(),
+            uefi::table::boot::TimerTrigger::Periodic(delay))?;
+    // Basically, this is a cached value of (LVI+1)%32.
+    // Anything besides initial CIV=0.
+    let mut queue_head = 1;
+    loop {
+        let civ = read_register_byte(pci, CIV_PCM_OUT).warning_as_error()?;
+        dump_pcm_out_registers(pci);
+        // Queue up some samples. Please note that no
+        // transfer took place yet if this is the first
+        // iteration thus we prefer to copy buffers faster.
+        if queue_head != civ {
+            let (bc, sc) = copy_samples_to_buffer(bdl, queue_head as usize, total_offset, samples);
+            if bc != 0 {
+                total_offset += sc;
+                total_sample_count -= sc;
+                write_register_byte(pci, LVI_PCM_OUT, queue_head as u8);
+                queue_head += 1;
+                if queue_head >= BUFFER_COUNT as u8 {
+                    queue_head = 0;
+                }
+            }
+        }
+        let picb = read_register_word(pci, PICB_PCM_OUT)
+            .warning_as_error()?;
+        if picb < channel_count {
+            // Maybe there is no other buffer queued up and
+            // thus we must end the playback instead of
+            // transferring a new chunk of data. Very unlikely
+            // but might cause a piece of junk being played otherwise.
+            let playback_done = boot_services()
+                .check_event (device.playback_event.unwrap())
+                .warning_as_error();
+            if playback_done.is_err() {
+                write_register_byte(pci, CONTROL_PCM_OUT, CONTROL_DMA_BIT)?;
+            } else {
+                break;
+            }
+            // Check for underrun condition. This is not a
+            // proper way to handle underrun but will still
+            // do it because it is simple.
+            let lvi = read_register_byte(pci, LVI_PCM_OUT).warning_as_error()?;
+            if lvi == civ {
+                break;
+            }
+        }
+        // Playback event must be placed first so that it
+        // would be checked first
+        let index = boot_services()
+            .wait_for_event (&mut [device.playback_event.unwrap(), device.picb_event.unwrap()])
+            .discard_errdata()?;
+        if index.unwrap() == 0 {
+            break;
+        }
+    }
+    info!("play_samples -- done");
+    Ok (().into())
 }
 
-
 fn dump_registers(pci: &PciIO) -> uefi::Result {
-    // TBD: why uninit?
-    let mut registers = mem::MaybeUninit::<BaseRegisterSet>::uninit();
+    let mut registers = BaseRegisterSet::default();
+    // SAFETY: TBD
     let buffer = unsafe {
-        core::slice::from_raw_parts_mut(registers.as_mut_ptr().cast(), mem::size_of::<BaseRegisterSet>())
+        core::slice::from_raw_parts_mut(
+            &mut registers as *mut BaseRegisterSet as *mut u16,
+            mem::size_of::<BaseRegisterSet>())
     };
-
     pci.read_io::<u16>(uefi::proto::pci::IoRegister::R0, 0, buffer)
-        .map(|completion| {
-            let (status, result) = completion.split();
-            info!("read registers: {:?}", status);
-            result
-        })
         .map_err(|error| {
             error!("reading registers failed: {:?}", error.status());
             error
-        })?;
-
-    info!("registers: {:#x?}", unsafe { registers.assume_init() });
-
+        })
+        .warning_as_error()?;
+    info!("registers: {:#x?}", registers);
     Ok(().into())
 }
 
-
-fn copy_samples(buffers: &mut Buffers, offset: usize, feed: &[u16]) -> (usize, usize) {
+fn copy_samples_to_buffer(bdl: &mut BufferDescriptorListWithBuffers, index: usize, offset: usize, samples: &[i16]) -> (usize, usize) {
     let mut buffer_offset = offset;
     let mut buffer_count = 0;
-    for (descriptor, buffer) in buffers.descriptors.iter_mut().zip(buffers.buffers.iter_mut()) {
-        let mut count : usize = 0;
-        for (index, v) in buffer.iter_mut().enumerate() {
-            if buffer_offset + index < feed.len() {
-                *v = feed[buffer_offset + index].to_be() as i16;
-                count += 1;
-            }
-        }
-        descriptor.length = 0;
-        descriptor.control = DESCRIPTOR_LAST_BIT;
-
-        info!("schedule {} samples starting at {}", count, buffer_offset);
-        if count > 0 {
+    for (descriptor, buffer) in bdl.descriptors.iter_mut().zip(bdl.buffers.iter_mut()).skip(index).take(1) {
+        let count = (samples.len() - buffer_offset).min(buffer.len());
+        &mut buffer[0..count]
+            .copy_from_slice(&samples[buffer_offset..buffer_offset+count]);
+        info!("copy_samples_to_buffer: schedule {} samples starting at {}", count, buffer_offset);
+        if count > 1 {
             buffer_offset += count as usize;
-            descriptor.length = count as u16 - 1;
+            descriptor.length = (count - 1) as u16;
             descriptor.control = 0;
+            buffer_count += 1;
+        } else {
+            descriptor.length = 0;
+            // TBD: ignored on qemu
+            descriptor.control = BDBAR_LAST_BIT;
         }
-        buffer_count += 1;
     }
     (buffer_count, buffer_offset - offset)
 }
@@ -727,118 +868,66 @@ fn div_round_up(a: usize, b: usize) -> usize {
     (a + b - 1) / b
 }
 
-fn isine(phase: usize, period: usize) -> i16 {
+fn square(phase: usize, period: usize) -> i16 {
     if (phase % period) * 2 < period {
-        i16::MIN
-    } else {
         i16::MAX
+    } else {
+        i16::MIN
     }
 }
 
-fn wave(buffers: &mut Buffers, channels: u16, sampling_rate: u32, freq: u16, samples: usize) -> (usize, usize) {
-    let mut buffer_count = 0;
-    let mut sample_count = 0;
-
-    const HALFPERIODS_PER_PERIOD: usize = 2;
-
+fn wave(buffer: &mut [i16], channels: u16, sampling_rate: u32, freq: u16) -> usize {
     if freq == 0 || channels == 0 || sampling_rate < freq as u32 {
         // TBD: other checks
-        return (0, 0);
+        return 0;
     }
-
     // Get the number of full periods as a number of frames
-    let frames_per_halfperiod   = sampling_rate as usize / freq as usize;
-    let samples_per_halfperiod  = channels as usize * frames_per_halfperiod;
-    let frames_per_buffer       = BUFFER_SIZE / channels as usize;
-    let full_halfperiods        = div_round_up(samples as usize, samples_per_halfperiod);
-    let full_frames             = full_halfperiods * frames_per_halfperiod;
-
-    info!("  samples {}", samples);
-    info!("  frames_per_halfperiod {}", frames_per_halfperiod);
-    info!("  frames_per_buffer {}", frames_per_buffer);
-    info!("  full_frames {}", full_frames);
-
-    let samples_per_period = channels as usize * frames_per_halfperiod * HALFPERIODS_PER_PERIOD;
-
-    for (descriptor, buffer) in buffers.descriptors.iter_mut().zip(buffers.buffers.iter_mut()) {
-        let mut count = 0;
-        let period_remained = if full_frames <= buffer_count * frames_per_buffer {
-            0
-        } else {
-            (full_frames - buffer_count * frames_per_buffer) / frames_per_halfperiod / HALFPERIODS_PER_PERIOD
-        };
-        for period in buffer.chunks_mut(samples_per_period).take(period_remained) {
-            for (index, v) in period.iter_mut().enumerate() {
-                let frame_index = index / channels as usize;
-                *v = isine(frame_index, frames_per_halfperiod * HALFPERIODS_PER_PERIOD);
-            }
-            count += period.len();
+    let samples_per_period      = channels as usize * sampling_rate as usize / freq as usize;
+    let periods                 = buffer.len() / samples_per_period;
+    let frames_per_period       = samples_per_period / channels as usize;
+    let mut count               = 0;
+    for period in buffer.chunks_mut(samples_per_period).take(periods) {
+        for (index, v) in period.iter_mut().enumerate() {
+            let frame_index = index / channels as usize;
+            *v = square(frame_index, frames_per_period);
         }
-        sample_count += count;
-        descriptor.length = 0;
-        descriptor.control = DESCRIPTOR_LAST_BIT;
-        if count > 0 {
-            info!("packed {} samples", count);
-            descriptor.length = (count - 1) as u16;
-            descriptor.control = 0;
-            buffer_count += 1;
-        }
+        count += period.len();
     }
-    (buffer_count, sample_count)
+    count
 }
 
-extern "efiapi" fn my_tone(this: &mut SimpleAudioOut, freq: u16, duration: u16) -> Status {
-
-    info!("my_tone");
-
+extern "efiapi" fn pcm_tone(this: &mut SimpleAudioOut, freq: u16, duration: u16) -> Status {
+    info!("pcm_tone");
     let device = DeviceContext::from_protocol_mut(boot_services(), this)
         .ok_or(uefi::Status::INVALID_PARAMETER.into())?;
-
-    let pci = boot_services()
-        .open_protocol::<PciIO>(device.handle, device.driver_handle, device.handle, OpenAttribute::GET_PROTOCOL)
-        .map(|completion| {
-            let (status, result) = completion.split();
-            info!("open PCI I/O: {:?}", status);
-            result
-        })
+    // Opening protocol with GET_PROTOCOL does not require
+    // use to close protocol but if we do we will remove all
+    // open protocol information from handle database (even
+    // with different attributes, even with BY_DRIVER).
+    let mut pci = boot_services()
+        .open_protocol::<PciIO>(
+            device.handle,
+            device.driver_handle,
+            device.handle,
+            OpenAttribute::GET_PROTOCOL)
         .map_err(|error| {
             error!("failed to open PCI I/O protocol: {:?}", error.status());
             error
-        })?;
-
+        })
+        .warning_as_error()?;
+    pci.dont_close();
+    // TBD: add api for supported modes enumeration and
+    //      choose an appropriate mode for modulation
     let channel_count = 2;
-    // let sampling_rate = 22100;
     let sampling_rate = 44100;
-    let mut samples = div_round_up(duration as usize * channel_count as usize * sampling_rate as usize, 1000);
-    info!("about to schedule a total of {} samples", samples);
-
-    pci.with_proto(|pci| init_playback(pci, sampling_rate, &mut *device))
-        .log_warning()?;
-
-    loop {
-        let buffers = unsafe { &mut *device.buffers };
-        let (buffer_count, sample_count) = wave(buffers, channel_count, sampling_rate, freq, samples);
-
-        info!("filled {} buffers, {} samples total", buffer_count, sample_count);
-
-        if buffer_count == 0 {
-            break;
-        }
-
-        if samples >= sample_count {
-            samples -= sample_count;
-        } else {
-            samples = 0;
-        }
-
-        info!("scheduled {} buffers {} samples", buffer_count, sample_count);
-
-        pci.with_proto(|pci| play_samples(pci, channel_count, sampling_rate, buffer_count, sample_count, &mut *device))
-            .warning_as_error()?;
-    }
-
-    info!("scheduling done {}", samples);
-
+    let mut tone_samples = alloc::vec::Vec::new();
+    tone_samples.resize(BUFFER_SIZE, 0);
+    let sample_count = wave(tone_samples.as_mut_slice(), channel_count, sampling_rate, freq);
+    tone_samples.truncate(sample_count);
+    pci.with_proto(|pci| init_playback(pci, sampling_rate, &mut *device))?;
+    pci.with_proto(|pci| loop_samples(pci, tone_samples.as_slice(), channel_count, sampling_rate, duration as u64, &mut *device))?;
+    pci.with_proto(|pci| stop_playback(pci))?;
+    info!("scheduled {} samples", sample_count);
     uefi::Status::SUCCESS
 }
 
@@ -847,114 +936,89 @@ fn milliseconds_to_timer_period(msec: u64) -> u64 {
     msec * 10000
 }
 
-extern "efiapi" fn my_feed(this: &mut SimpleAudioOut, sampling_rate: u32, feed: *const u16, feed_count: usize) -> Status {
-
-    info!("my_feed");
-
+extern "efiapi" fn pcm_write(this: &mut SimpleAudioOut, sampling_rate: u32, samples: *const i16, sample_count: usize) -> Status {
+    info!("pcm_write");
+    // TBD: this is a pointer and we should check it for alignment and null
     let device = DeviceContext::from_protocol_mut(boot_services(), this)
         .ok_or(uefi::Status::INVALID_PARAMETER.into())?;
-
-    let pci = boot_services()
-        .open_protocol::<PciIO>(device.handle, device.driver_handle, device.handle, OpenAttribute::GET_PROTOCOL)
-        .map(|completion| {
-            let (status, result) = completion.split();
-            info!("open PCI I/O: {:?}", status);
-            result
-        })
+    // Opening protocol with GET_PROTOCOL does not require
+    // use to close protocol but if we do we will remove all
+    // open protocol information from handle database (even
+    // with different attributes, even with BY_DRIVER).
+    let mut pci = boot_services()
+        .open_protocol::<PciIO>(
+            device.handle,
+            device.driver_handle,
+            device.handle,
+            OpenAttribute::GET_PROTOCOL)
         .map_err(|error| {
             error!("failed to open PCI I/O protocol: {:?}", error.status());
             error
-        })?;
-
-    // TBD:
-    // feed must be not null
-    // feed must be aligned
-    // feed_count must be not bigger than isize::MAX
-    // feed must be readable in range [0, feed_count)
-    // feed must not be mutated
-    // each element of feed must be properly initialized
-
-    // SAFETY: feed align is checked and read access guarantee is on the caller
-    let feed = unsafe { core::slice::from_raw_parts(feed, feed_count) };
-    let mut samples = feed_count;
-    let mut offset = 0;
-    info!("about to schedule a total of {} samples", samples);
-
-    pci.with_proto(|pci| init_playback(pci, sampling_rate, &mut *device))
-            .warning_as_error()?;
-
-    while samples > 0 {
-        let (buffer_count, sample_count) = copy_samples( unsafe { &mut *device.buffers }, offset, feed);
-
-        offset += sample_count;
-        samples -= sample_count;
-
-        info!("scheduled {} buffers {} samples", buffer_count, sample_count);
-
-        pci.with_proto(|pci| play_samples(pci, 2, sampling_rate, buffer_count, sample_count, &mut *device))
-            .warning_as_error()?;
+        })
+        .warning_as_error()?;
+    pci.dont_close();
+    if samples.is_null() || sample_count >= isize::MAX as usize {
+        return uefi::Status::INVALID_PARAMETER;
     }
-
-    info!("scheduling done {}", samples);
-
+    // We check the alignment of the pointer as well because this is generally enforced by EDK2
+    if (samples as *mut u8 as usize) % mem::align_of::<i16>() != 0 {
+        return uefi::Status::INVALID_PARAMETER;
+    }
+    // TBD: add api for supported modes enumeration and
+    //      choose an appropriate mode for synth
+    let channel_count = 2;
+    // TBD: samples must be readable in range [0, sample_count)
+    // TBD: samples must not be mutated
+    // TBD: each element of samples must be properly initialized
+    // SAFETY: this is safe because samples are checked for null, alignment and size
+    let samples = unsafe { core::slice::from_raw_parts(samples, sample_count) };
+    info!("about to schedule a total of {} samples", sample_count);
+    pci.with_proto(|pci| init_playback(pci, sampling_rate, &mut *device))?;
+    pci.with_proto(|pci| play_samples(pci, samples, channel_count, sampling_rate, &mut *device))?;
+    pci.with_proto(|pci| stop_playback(pci))?;
+    info!("scheduling done {}", sample_count);
     uefi::Status::SUCCESS
-}
-
-
-extern "efiapi" fn my_reset(this: &mut SimpleAudioOut) -> Status {
-    info!("my_reset");
-
-    uefi::Status::UNSUPPORTED
 }
 
 //
 // DriverBinding routines
 //
 
-//
-// PCI Vendor ID
-//
-const INTEL: u16 = 0x8086;
-
-extern "efiapi" fn my_supported(this: &DriverBinding, handle: Handle, remaining_path: *mut DevicePath) -> Status {
-
-    let bt = boot_services();
-
-    let pci = bt
+extern "efiapi" fn pcm_supported(this: &DriverBinding, handle: Handle, remaining_path: *mut DevicePath) -> Status {
+    // Opening the protocol BY_DRIVER results in
+    // UNSUPPORTED, SUCCESS or ACCESS_DENIED. All must be
+    // passed to boot manager.
+    let pci = boot_services()
         .open_protocol::<PciIO>(handle, this.driver_handle(), handle, OpenAttribute::BY_DRIVER)
         .log_warning()?;
-
-    info!("my_supported -- got PCI");
-
+    info!("pcm_supported -- got PCI");
     pci.with_proto(|pci| {
-        let mut type00 = mem::MaybeUninit::<PciType00>::uninit();
+        let mut type00: PciType00 = Default::default();
+        // SAFETY: TBD
         let buffer = unsafe {
-            core::slice::from_raw_parts_mut(type00.as_mut_ptr().cast(), mem::size_of::<PciType00>())
+            core::slice::from_raw_parts_mut(
+                &mut type00 as *mut PciType00 as *mut u8,
+                mem::size_of::<PciType00>())
         };
         pci.read_config::<u8>(0, buffer)
-            .map(|completion| {
-                let (status, result) = completion.split();
-                info!("read_config type00: {:?}", status);
-                result
-            })
             .map_err(|error| {
                 error!("read_config type00: {:?}", error.status());
                 error
-            })?;
-        let type00 = unsafe { type00.assume_init() };
+            })
+            .warning_as_error()?;
         info!("vendor: {:#x}, device: {:#x}", type00.vendor_id, type00.device_id);
         let supported = {
             [
-                (INTEL, 0x2415), // Intel 82801AA (ICH) integrated AC'97 Controller
-                (INTEL, 0x2425), // Intel 82801AB (ICH0) integrated AC'97 Controller
-                (INTEL, 0x2445), // Intel 82801BA (ICH2) integrated AC'97 Controller
-                (INTEL, 0x2485), // Intel 82801CA (ICH3) integrated AC'97 Controller
-                (INTEL, 0x24c5), // Intel 82801DB (ICH4) integrated AC'97 Controller
-                (INTEL, 0x24d5), // Intel 82801EB/ER (ICH5/ICH5R) integrated AC'97 Controller
-                (INTEL, 0x25a6), // Intel 6300ESB integrated AC'97 Controller
-                (INTEL, 0x266e), // Intel 82801FB (ICH6) integrated AC'97 Controller
-                (INTEL, 0x27de), // Intel 82801GB (ICH7) integrated AC'97 Controller
-                (INTEL, 0x7195), // Intel 82443MX integrated AC'97 Controller
+                (VID_INTEL, 0x2415), // Intel 82801AA (ICH) integrated AC'97 Controller
+                (VID_INTEL, 0x2425), // Intel 82801AB (ICH0) integrated AC'97 Controller
+                (VID_INTEL, 0x2445), // Intel 82801BA (ICH2) integrated AC'97 Controller
+                (VID_INTEL, 0x2485), // Intel 82801CA (ICH3) integrated AC'97 Controller
+                (VID_INTEL, 0x24c5), // Intel 82801DB (ICH4) integrated AC'97 Controller
+                (VID_INTEL, 0x24d5), // Intel 82801EB/ER (ICH5/ICH5R) integrated AC'97 Controller
+                (VID_INTEL, 0x25a6), // Intel 6300ESB integrated AC'97 Controller
+                (VID_INTEL, 0x266e), // Intel 82801FB (ICH6) integrated AC'97 Controller
+                (VID_INTEL, 0x27de), // Intel 82801GB (ICH7) integrated AC'97 Controller
+                (VID_INTEL, 0x7195), // Intel 82443MX integrated AC'97 Controller
             ].iter().any(|&(vid, did)| {
                 type00.vendor_id == vid && type00.device_id == did
             })
@@ -964,165 +1028,134 @@ extern "efiapi" fn my_supported(this: &DriverBinding, handle: Handle, remaining_
         }
         Ok(().into())
     }).log_warning()?;
-
     pci.close()
-        .map(|completion| {
-            let (status, result) = completion.split();
-            info!("close protocol PCI I/O: {:?}", status);
-            result
-        })
         .map_err(|error| {
             error!("close protocol PCI I/O failed: {:?}", error.status());
             error
-        })?;
-
-    info!("my_supported -- ok");
-
+        })
+        .warning_as_error()?;
+    info!("pcm_supported -- ok");
     uefi::Status::SUCCESS
 }
 
-
-extern "efiapi" fn my_start(this: &DriverBinding, handle: Handle, remaining_path: *mut DevicePath) -> Status {
-
-    info!("my_start");
-
-    let bt = boot_services();
-
+extern "efiapi" fn pcm_start(this: &DriverBinding, handle: Handle, remaining_path: *mut DevicePath) -> Status {
+    info!("pcm_start");
     // Sync with stop
-    let _tpl = unsafe { bt.raise_tpl(uefi::table::boot::Tpl::NOTIFY) };
-
-    let pci = bt
+    // SAFETY: when called by firmware we will be at notify or callback; for other cases we may
+    //         as well check current TPL
+    let _tpl = unsafe { boot_services().raise_tpl(uefi::table::boot::Tpl::NOTIFY) };
+    let mut pci = boot_services()
         .open_protocol::<PciIO>(handle, this.driver_handle(), handle, OpenAttribute::BY_DRIVER)
-        .map(|completion| {
-            let (status, result) = completion.split();
-            info!("open PCI I/O protocol: {:?}", status);
-            result
-        })
         .map_err(|error| {
             error!("failed to open PCI I/O protocol: {:?}", error.status());
             error
-        })?;
-
-    let device = pci
-        .with_proto(|pci| init_audio_codec(this.driver_handle(), handle, pci))
-        .log_warning()?;
-
-    let audio_out = &device.for_plebs;
-
-    bt.install_interface::<SimpleAudioOut>(handle, audio_out)
-        .map(|completion| {
-            let (status, result) = completion.split();
-            info!("open audio protocol: {:?}", status);
-            result
         })
+        .warning_as_error()?;
+    let device = pci
+        .with_proto(|pci| init_device_context(this.driver_handle(), handle, pci))
+        .log_warning()?;
+    let audio_out = &device.audio_interface;
+    boot_services()
+        .install_interface::<SimpleAudioOut>(handle, audio_out)
         .map_err(|error| {
             error!("failed to install audio protocol: {:?}", error.status());
             error
-        })?;
-
-    pci.with_proto(dump_registers)
+        })
         .warning_as_error()?;
-
-    // pci.with_proto(|pci| test_audio_codec(pci, &mut *device))
-    //     .log_warning()
-    //     .expect("not problem init");
-
+    pci.with_proto(dump_registers)?;
     // consume PCI I/O
-    uefi::table::boot::leak(pci);
-
+    pci.dont_close();
     // produce audio protocol and let it live in database as
     // long as the driver's image stay resident or until the
     // DisconnectController() will be invoked
     mem::forget(device);
-
-    info!("my_start -- ok");
-
+    info!("pcm_start -- ok");
     uefi::Status::SUCCESS
 }
 
-extern "efiapi" fn my_stop(this: &DriverBinding, controller: Handle, _num_child_controller: usize, _child_controller: *mut Handle) -> Status {
-
-    info!("my_stop");
-
-    let bt = boot_services();
-
+fn pcm_stop(this: &DriverBinding, controller: Handle) -> uefi::Result {
+    info!("pcm_stop");
     // Sync with start
-    let _tpl = unsafe { bt.raise_tpl(uefi::table::boot::Tpl::NOTIFY) };
-
-    let audio_out = bt
-        .open_protocol::<SimpleAudioOut>(controller, this.driver_handle(), controller, OpenAttribute::GET_PROTOCOL)
-        .map(|completion| {
-            let (status, result) = completion.split();
-            info!("open audio protocol: {:?}", status);
-            result
-        })
+    // SAFETY: when called by firmware we will be at notify or callback; for other cases we may
+    //         as well check current TPL
+    let _tpl = unsafe { boot_services().raise_tpl(uefi::table::boot::Tpl::NOTIFY) };
+    let audio_out = boot_services()
+        .open_protocol::<SimpleAudioOut>(
+            controller,
+            this.driver_handle(),
+            controller,
+            OpenAttribute::GET_PROTOCOL)
         .map_err(|error| {
             error!("failed to open audio protocol: {:?}", error.status());
             error
-        })?;
-
-    let pci = bt
-        .open_protocol::<PciIO>(controller, this.driver_handle(), controller, OpenAttribute::GET_PROTOCOL)
-        .map(|completion| {
-            let (status, result) = completion.split();
-            info!("open PCI I/O: {:?}", status);
-            result
         })
+        .warning_as_error()?;
+    // Opening protocol with GET_PROTOCOL does not require
+    // use to close protocol but if we do we will remove all
+    // open protocol information from handle database (even
+    // with different attributes, even with BY_DRIVER).
+    let mut pci = boot_services()
+        .open_protocol::<PciIO>(
+            controller,
+            this.driver_handle(),
+            controller,
+            OpenAttribute::GET_PROTOCOL)
         .map_err(|error| {
             error!("failed to open PCI I/O protocol: {:?}", error.status());
             error
-        })?;
-
-    // This is safe assuming that audio_out was created by us
-    // let audio_out = unsafe { Box::from_raw(audio_out.as_proto().get()) };
-    let audio_out = audio_out.as_proto().get();
-
-    // Note that this operation does not consume anything
-    let device = DeviceContext::from_protocol_mut(boot_services(), audio_out)
-        .ok_or(uefi::Status::INVALID_PARAMETER.into())?;
-
-    let audio_out_ref = unsafe { audio_out.as_ref().unwrap() };
-
-    bt.uninstall_interface::<SimpleAudioOut>(controller, audio_out_ref)
-        .map(|completion| {
-            let (status, result) = completion.split();
-            info!("uninstall audio protocol: {:?}", status);
-            result
         })
+        .warning_as_error()?;
+    pci.dont_close();
+    let audio_out = audio_out.as_proto().get();
+    // Note that this operation does not consume anything
+    let device = if let Some(device) = DeviceContext::from_protocol_mut(boot_services(), audio_out) {
+        device
+    } else {
+        return uefi::Status::INVALID_PARAMETER.into();
+    };
+    // SAFETY: TBD
+    let audio_out_ref = unsafe { audio_out.as_ref().unwrap() };
+    boot_services()
+        .uninstall_interface::<SimpleAudioOut>(controller, audio_out_ref)
         .map_err(|error| {
             error!("failed uninstall audio protocol: {:?}", error.status());
             error
-        })?;
-
+        })
+        .warning_as_error()?;
+    // SAFETY: safe as long as DeviceContext is only created inside the Box
     let device = unsafe {
         Box::from_raw(device as *mut DeviceContext)
     };
+    info!("pcm_stop -- ok");
+    Ok(().into())                     // drop audio
+}
 
-    pci.with_proto(|pci| deinit_audio_codec(pci, device.mapping))
-        .log_warning()
-        .map_err(|error| {
-            warn!("Failed to deinitialize audio codec: {:?}", error.status());
-            error
-        })
-        .or::<()>(Ok(().into()))
-        .unwrap();                                       // ignore error
-
-    info!("my_stop -- ok");
-
-    uefi::Status::SUCCESS                                // drop audio here if everything allright
+extern "efiapi" fn pcm_stop_entry(this: &DriverBinding, controller: Handle, _num_child_controller: usize, _child_controller: *mut Handle) -> Status {
+    pcm_stop(this, controller)
+        .status()
 }
 
 //
 // Image entry points
 //
 
-extern "efiapi" fn my_unload(image_handle: Handle) -> Status {
-
-    info!("my_unload");
-
-    let bt = boot_services();
-
-    let handles = bt.find_handles::<SimpleAudioOut>()
+extern "efiapi" fn pcm_unload(image_handle: Handle) -> Status {
+    info!("pcm_unload");
+    let driver_binding = boot_services()
+        .open_protocol::<DriverBinding>(
+            image_handle,
+            image_handle,
+            image_handle,
+            OpenAttribute::GET_PROTOCOL)
+        .map_err(|error| {
+            error!("failed to open driver binding: {:?}", error.status());
+            error
+        })
+        .warning_as_error()?;
+    // SAFETY: TBD
+    let driver_binding_ref = unsafe { &*driver_binding.as_proto().get() };
+    let handles = boot_services()
+        .find_handles::<SimpleAudioOut>()
         .log_warning()
         .map_err(|error| {
             warn!("failed to get simple audio protocol handles: {:?}", error.status());
@@ -1134,103 +1167,73 @@ extern "efiapi" fn my_unload(image_handle: Handle) -> Status {
                 Err(error)
             }
         })?;
-
     for controller in handles {
-        bt.disconnect(controller, Some(image_handle), None)
-            .warning_as_error()
-            .map_err(|error| {
-                error!("failed to disconnect audio handle: {:?}", error.status());
-                error
+        // Checking error is crucial because Unload() must
+        // fail if something went wrong
+        pcm_stop(driver_binding_ref, controller)
+            .or_else(|error| {
+                // If handle is controlled by our driver just skip it
+                if error.status() == uefi::Status::INVALID_PARAMETER {
+                    Ok(().into())
+                } else {
+                    Err(error)
+                }
             })?;
     }
-
-    let driver_binding = bt
-        .open_protocol::<DriverBinding>(image_handle, image_handle, image_handle, OpenAttribute::GET_PROTOCOL)
-        .map(|completion| {
-            let (status, result) = completion.split();
-            info!("open driver binding: {:?}", status);
-            result
-        })
-        .map_err(|error| {
-            error!("failed to open driver binding: {:?}", error.status());
-            error
-        })?;
-
-    let driver_binding_ref = unsafe { driver_binding.as_proto().get().as_ref().unwrap() };
-
-    bt.uninstall_interface::<DriverBinding>(image_handle, driver_binding_ref)
-        .map(|completion| {
-            let (status, result) = completion.split();
-            info!("uninstall driver: {:?}", status);
-        })
+    boot_services()
+        .uninstall_interface::<DriverBinding>(image_handle, driver_binding_ref)
         .map_err(|error| {
             error!("failed to uninstall driver binding: {:?}", error.status());
             error
-        })?;
-
+        })
+        .warning_as_error()?;
     // Driver binding is already disconnected and it is
     // about to be destroyed so no need to close it.
     let driver_binding = uefi::table::boot::leak(driver_binding);
+    // SAFETY: TBD
     unsafe { Box::from_raw(driver_binding.get()) };
-
-    info!("my_unload -- ok");
-
+    info!("pcm_unload -- ok");
     // Cleanup allocator and logging facilities
     efi_dxe::unload(image_handle);
-
     uefi::Status::SUCCESS
 }
 
 #[entry]
 fn efi_main(handle: uefi::Handle, system_table: SystemTable<Boot>) -> uefi::Status {
-
     efi_dxe::init(handle, &system_table)
         .warning_as_error()?;
-
     info!("efi_main");
-
     // TBD: allocate in runtime pool or .bss
     let driver_binding = Box::new(DriverBinding::new(
-        my_start,
-        my_supported,
-        my_stop,
+        pcm_start,
+        pcm_supported,
+        pcm_stop_entry,
         0x0,
         handle,
         handle)
     );
-
-    let bt = boot_services();
-
-    let loaded_image = bt
+    let loaded_image = boot_services()
         .handle_protocol::<LoadedImage>(handle)
         .warning_as_error()?;
-
+    // SAFETY: TBD
     let loaded_image = unsafe { &mut *loaded_image.get() };
-
-    loaded_image.set_unload_routine(Some(my_unload));
-
+    loaded_image.set_unload_routine(Some(pcm_unload));
     let driver_binding = Box::into_raw(driver_binding);
-
+    // SAFETY: TBD
     let driver_binding_ref = unsafe { driver_binding.as_ref().unwrap() };
-
-    bt.install_interface::<DriverBinding>(handle, driver_binding_ref)
-        .map(|completion| {
-            let (status, result) = completion.split();
-            info!("install driver binding: {:?}", status);
-            result
-        })
+    boot_services()
+        .install_interface::<DriverBinding>(handle, driver_binding_ref)
         .map_err(|error| {
             error!("failed to install driver binding: {:?}", error.status());
+            // SAFETY: TBD
             unsafe { Box::from_raw(driver_binding) };
-            error.status().into()
-        })?;
-
-    info!("initialization complete");
-
-    bt.handle_protocol::<DriverBinding>(handle)
+            error
+        })
         .warning_as_error()?;
-
+    info!("initialization complete");
+    boot_services()
+        .handle_protocol::<DriverBinding>(handle)
+        .warning_as_error()?;
     info!("efi_main -- ok");
-
     uefi::Status::SUCCESS
 }

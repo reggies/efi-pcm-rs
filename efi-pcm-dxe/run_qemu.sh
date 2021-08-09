@@ -11,9 +11,9 @@ pushd ../efi-pcm-test
 ./build.sh
 popd
 
-pushd ../edk2-test
-./build.sh
-popd
+# pushd ../edk2-test
+# ./build.sh
+# popd
 
 cp ./target/x86_64-unknown-uefi/debug/efi-pcm-dxe.efi hda
 cp ~/edk2/Build/RustTestPkg/DEBUG_GCC5/X64/Launcher.efi hda
