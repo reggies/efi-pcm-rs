@@ -441,20 +441,20 @@ fn probe_master_volume(pci: &PciIO) -> uefi::Result<u16, ()> {
     }
 }
 
-fn set_sampling_rate(pci: &PciIO, sampling_rate: u16) -> uefi::Result {
-    if sampling_rate != 8000 &&
-        sampling_rate != 11025 &&
-        sampling_rate != 16000 &&
-        sampling_rate != 22050 &&
-        sampling_rate != 32000 &&
-        sampling_rate != 44100 &&
-        sampling_rate != 48000
+fn set_sampling_rate(pci: &PciIO, sampling_rate: u32) -> uefi::Result {
+    if sampling_rate != AUDIO_RATE_8000 &&
+        sampling_rate != AUDIO_RATE_11025 &&
+        sampling_rate != AUDIO_RATE_16000 &&
+        sampling_rate != AUDIO_RATE_22050 &&
+        sampling_rate != AUDIO_RATE_32000 &&
+        sampling_rate != AUDIO_RATE_44100 &&
+        sampling_rate != AUDIO_RATE_48000
     {
         return uefi::Status::INVALID_PARAMETER.into()
     }
-    pci.write_io::<u16>(uefi::proto::pci::IoRegister::R0, PCM_RATE_FRONT, &[sampling_rate])?;
-    pci.write_io::<u16>(uefi::proto::pci::IoRegister::R0, PCM_RATE_SURROUND, &[sampling_rate])?;
-    pci.write_io::<u16>(uefi::proto::pci::IoRegister::R0, PCM_RATE_LFE, &[sampling_rate])?;
+    pci.write_io::<u16>(uefi::proto::pci::IoRegister::R0, PCM_RATE_FRONT, &[sampling_rate as u16])?;
+    pci.write_io::<u16>(uefi::proto::pci::IoRegister::R0, PCM_RATE_SURROUND, &[sampling_rate as u16])?;
+    pci.write_io::<u16>(uefi::proto::pci::IoRegister::R0, PCM_RATE_LFE, &[sampling_rate as u16])?;
     Ok(().into())
 }
 
@@ -611,14 +611,12 @@ fn init_device_context(driver_handle: Handle, handle: Handle, pci: &PciIO) -> ue
         playback_event,
         bdl,
         audio_interface: SimpleAudioOut {
-            reset: 0,
+            reset: pcm_reset,
             write: pcm_write,
             tone: pcm_tone,
-            set_mode: 0,
-            query_mode: 0,
-            max_mode: 0,
-            mode: 0,
-            capabilities: 0
+            query_mode: pcm_query_mode,
+            max_mode: 1,
+            capabilities: AUDIO_CAP_RESET | AUDIO_CAP_WRITE | AUDIO_CAP_TONE | AUDIO_CAP_MODE
         }
     });
     Ok (device.into())
@@ -628,7 +626,7 @@ fn init_playback(pci: &PciIO, sampling_rate: u32, device: &mut DeviceContext) ->
     let max_master_volume = probe_master_volume(pci)
         .warning_as_error()?;
     info!("max master volume: {:#?}", max_master_volume);
-    set_sampling_rate(pci, sampling_rate as u16)?;
+    set_sampling_rate(pci, sampling_rate)?;
     set_channel_count(pci, CHANNELS_2)?;
     set_master_volume(pci, stereo_volume(0, 0, false))?;
     pci.flush()?;
@@ -641,7 +639,7 @@ fn stop_playback(pci: &PciIO) -> uefi::Result {
     Ok (().into())
 }
 
-fn loop_samples(pci: &PciIO, samples: &[i16], channel_count: u16, sampling_rate: u32, duration: u64, device: &mut DeviceContext) -> uefi::Result {
+fn loop_samples(pci: &PciIO, samples: &[i16], channel_count: u8, sampling_rate: u32, duration: u64, device: &mut DeviceContext) -> uefi::Result {
     // Disable interrupts in PCM OUT transfer control register and
     // set Reset Registers (RR) bit
     //
@@ -702,7 +700,7 @@ fn loop_samples(pci: &PciIO, samples: &[i16], channel_count: u16, sampling_rate:
         dump_pcm_out_registers(pci);
         let picb = read_register_word(pci, PICB_PCM_OUT).warning_as_error()?;
         let civ = read_register_byte(pci, CIV_PCM_OUT).warning_as_error()?;
-        if picb < channel_count {
+        if picb < channel_count as u16 {
             if civ >= 1 {
                 write_register_byte(pci, CONTROL_PCM_OUT, CONTROL_RESET_BIT)?;
                 wait_byte(pci, RESET_TIMEOUT, CONTROL_PCM_OUT, CONTROL_RESET_BIT, 0)?;
@@ -724,7 +722,7 @@ fn loop_samples(pci: &PciIO, samples: &[i16], channel_count: u16, sampling_rate:
     Ok (().into())
 }
 
-fn play_samples(pci: &PciIO, samples: &[i16], channel_count: u16, sampling_rate: u32, device: &mut DeviceContext) -> uefi::Result {
+fn play_samples(pci: &PciIO, samples: &[i16], channel_count: u8, sampling_rate: u32, device: &mut DeviceContext) -> uefi::Result {
     let mut total_offset = 0;
     let mut total_sample_count = samples.len();
     let mapping = pci
@@ -790,7 +788,7 @@ fn play_samples(pci: &PciIO, samples: &[i16], channel_count: u16, sampling_rate:
         }
         let picb = read_register_word(pci, PICB_PCM_OUT)
             .warning_as_error()?;
-        if picb < channel_count {
+        if picb < channel_count as u16 {
             // Maybe there is no other buffer queued up and
             // thus we must end the playback instead of
             // transferring a new chunk of data. Very unlikely
@@ -876,7 +874,7 @@ fn square(phase: usize, period: usize) -> i16 {
     }
 }
 
-fn wave(buffer: &mut [i16], channels: u16, sampling_rate: u32, freq: u16) -> usize {
+fn wave(buffer: &mut [i16], channels: u8, sampling_rate: u32, freq: u16) -> usize {
     if freq == 0 || channels == 0 || sampling_rate < freq as u32 {
         // TBD: other checks
         return 0;
@@ -916,10 +914,8 @@ extern "efiapi" fn pcm_tone(this: &mut SimpleAudioOut, freq: u16, duration: u16)
         })
         .warning_as_error()?;
     pci.dont_close();
-    // TBD: add api for supported modes enumeration and
-    //      choose an appropriate mode for modulation
     let channel_count = 2;
-    let sampling_rate = 44100;
+    let sampling_rate = AUDIO_RATE_44100;
     let mut tone_samples = alloc::vec::Vec::new();
     tone_samples.resize(BUFFER_SIZE, 0);
     let sample_count = wave(tone_samples.as_mut_slice(), channel_count, sampling_rate, freq);
@@ -936,7 +932,7 @@ fn milliseconds_to_timer_period(msec: u64) -> u64 {
     msec * 10000
 }
 
-extern "efiapi" fn pcm_write(this: &mut SimpleAudioOut, sampling_rate: u32, samples: *const i16, sample_count: usize) -> Status {
+extern "efiapi" fn pcm_write(this: &mut SimpleAudioOut, sampling_rate: u32, channel_count: u8, format: u32, samples: *const i16, sample_count: usize) -> Status {
     info!("pcm_write");
     // TBD: this is a pointer and we should check it for alignment and null
     let device = DeviceContext::from_protocol_mut(boot_services(), this)
@@ -957,6 +953,14 @@ extern "efiapi" fn pcm_write(this: &mut SimpleAudioOut, sampling_rate: u32, samp
         })
         .warning_as_error()?;
     pci.dont_close();
+    if channel_count != 2 {
+        warn!("The channel count {} is not supported!", channel_count);
+        return uefi::Status::INVALID_PARAMETER;
+    }
+    if format != AUDIO_FORMAT_S16LE {
+        warn!("The format {:x} is not supported!", format);
+        return uefi::Status::INVALID_PARAMETER;
+    }
     if samples.is_null() || sample_count >= isize::MAX as usize {
         return uefi::Status::INVALID_PARAMETER;
     }
@@ -964,9 +968,6 @@ extern "efiapi" fn pcm_write(this: &mut SimpleAudioOut, sampling_rate: u32, samp
     if (samples as *mut u8 as usize) % mem::align_of::<i16>() != 0 {
         return uefi::Status::INVALID_PARAMETER;
     }
-    // TBD: add api for supported modes enumeration and
-    //      choose an appropriate mode for synth
-    let channel_count = 2;
     // TBD: samples must be readable in range [0, sample_count)
     // TBD: samples must not be mutated
     // TBD: each element of samples must be properly initialized
@@ -977,6 +978,29 @@ extern "efiapi" fn pcm_write(this: &mut SimpleAudioOut, sampling_rate: u32, samp
     pci.with_proto(|pci| play_samples(pci, samples, channel_count, sampling_rate, &mut *device))?;
     pci.with_proto(|pci| stop_playback(pci))?;
     info!("scheduling done {}", sample_count);
+    uefi::Status::SUCCESS
+}
+
+extern "efiapi" fn pcm_reset(this: &mut SimpleAudioOut) -> Status {
+    info!("pcm_reset");
+    info!("pcm_reset -- ok");
+    uefi::Status::SUCCESS
+}
+
+extern "efiapi" fn pcm_query_mode(this: &mut SimpleAudioOut, index: usize, mode: &mut SimpleAudioMode) -> Status {
+    info!("pcm_query_mode");
+    if index > 0 {
+        // We only support a single mode -
+        // Stereo|S16_LE|22050hz. Other modes can be
+        // specified too in write() but they are not
+        // guaranteed to work.
+        warn!("Requested mode with index {} does not exist", index);
+        return uefi::Status::INVALID_PARAMETER;
+    }
+    mode.sampling_rate = AUDIO_RATE_22050;
+    mode.channel_count = 2;
+    mode.sample_format = AUDIO_FORMAT_S16LE;
+    info!("pcm_query_mode -- ok");
     uefi::Status::SUCCESS
 }
 

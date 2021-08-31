@@ -1,20 +1,26 @@
 * Top
-** DONE react on ExitBootServices
-*** when notified we must disable all controllers
+** still possible to interrupt pcm_tone/pcm_write by ExitBootServices notification
 ** OpenProtocol::with_proto is bullshit
 ** PCI memory buffer mapping is duplicated
-* Bottom
-** TODO ComponentName and ComponentName2
-
-** TODO qemu-ac97 + apic + IOC = interrupt not fired; why?
-** TODO port the driver to SMM
-** TODO look at snd_pcm_writei() from alsa
+** uefi::table::boot::leak vs core::mem::forget vs uefi::table::boot::OpenProtocol::dont_close
+** DONE look at snd_pcm_writei() from alsa
    - usage code
      pcm = alsaaudio.PCM(alsaaudio.PCM_PLAYBACK, alsaaudio.PCM_NORMAL)
      pcm.setrate(44100)
      pcm.setchannels(2)
      pcm.setperiodsize(1000)
      pcm.setformat(alsaaudio.PCM_FORMAT_S16_LE)
+   - [X] what is alsaaudio.PCM
+     - [X] what is alsaaudio.PCM_PLAYBACK
+       - type; either capture or playback
+     - [X] what is alsaaudio.PCM_NORMAL
+       - mode; either nonblock or normal
+   - [X] what is outp.setperiodsize(1920)
+     - measured in hz; a size of the buffer we feed into DMA or a delay of the picb timer
+* Bottom
+** TODO ComponentName and ComponentName2
+** TODO qemu-ac97 + apic + IOC = interrupt not fired; why?
+** TODO port the driver to SMM
 ** TODO extend the API for other PCM formats, sampling rates, channel count and volume
 ** TODO understand how OpenCorePkg represents audio data and audio protocols
    - BeepGen -- done

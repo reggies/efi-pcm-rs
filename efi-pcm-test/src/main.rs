@@ -114,7 +114,9 @@ fn efi_main(_handle: uefi::Handle, system_table: SystemTable<Boot>) -> uefi::Sta
         .log_warning()?;
     let audio_out = unsafe { &mut *audio_out.get() };
     let data = unsafe { core::mem::transmute(data::TEST_DATA) };
-    audio_out.write(22050, data)
+    audio_out.reset()
+        .warning_as_error()?;
+    audio_out.write(efi_pcm::AUDIO_RATE_22050, 2, efi_pcm::AUDIO_FORMAT_S16LE, data)
         .map_err(|error| {
             error!("pcm write failed: {:?}", error.status());
             error
