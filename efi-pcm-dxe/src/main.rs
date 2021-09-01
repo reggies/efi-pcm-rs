@@ -5,7 +5,8 @@
 #![allow(unused_variables)]
 
 // We are accessing packed structures. Make sure that we
-// don't produce undefined behavior
+// don't produce undefined behavior e.g. by passing fields
+// to println!() macro.
 #![deny(unaligned_references)]
 
 // TBD: needed to allocate BDL on the heap without creating
@@ -61,52 +62,63 @@ macro_rules! static_assert {
     };
 }
 
-/// PCI Device Configuration Space
-/// Section 6.1, PCI Local Bus Specification, 2.2
-///
-/// Note that this struct is supposed to be packed but rustc
-/// complains about unaligned field access and unaligned
-/// references, but with repr(C) this structure is naturally
-/// aligned so that we will only ensure the proper size
-/// with static_assert().
-#[repr(C)]
+/// PCI Configuration Space
+/// Section 2.1, Intel I/O Controller Hub 7 Family External Design Specification, April 2005
+const PCI_VID: u32      = 0x0;                      // ro, u16
+const PCI_DID: u32      = 0x2;                      // ro, u16
+const PCI_COMMAND: u32  = 0x4;                      // rw, u16
+const PCI_STATUS: u32   = 0x6;                      // rwc, u16
+const PCI_RID: u32      = 0x8;                      // ro, u8
+const PCI_PI: u32       = 0x9;                      // ro, u8
+const PCI_SCC: u32      = 0xA;                      // ro, u8
+const PCI_BCC: u32      = 0xB;                      // ro, u8
+const PCI_NAMBBAR: u32  = 0x10;                     // rw, u32
+const PCI_NBMBBAR: u32  = 0x14;                     // rw, u32
+const PCI_MMBAR: u32    = 0x18;                     // rw, u32
+const PCI_MBBAR: u32    = 0x1C;                     // rw, u32
+const PCI_INT_LN: u32   = 0x3C;                     // rw, u8
+const PCI_INT_PN: u32   = 0x3D;                     // ro, u8
+
+#[repr(C, packed)]
 #[derive(Clone, Copy, Debug, Default)]
 struct PciType00 {
-    vendor_id: u16,
-    device_id: u16,
-    command: u16,
-    status: u16,
-    revision_id: u8,
-    class_code: [u8; 3],
-    cache_line_size: u8,
-    latency_timer: u8,
-    header_type: u8,
-    bist: u8,
-    base_address_registers: [u32; 6],
-    cardbus_cis_pointer: u32,
-    subsystem_vendor_id: u16,
-    subsystem_id: u16,
-    expansion_rom_base_address: u32,
-    capability_ptr: u8,
-    reserved1: [u8; 3],
-    reserved2: u32,
-    interrupt_line: u8,
-    interrupt_pin: u8,
-    min_gnt: u8,
-    max_lat: u8,
+    vendor_id: u16,                                      // 0-1
+    device_id: u16,                                      // 2-3
+    command: u16,                                        // 4-5
+    status: u16,                                         // 6-7
+    revision_identification: u8,                         // 8
+    programming_interface: u8,                           // 9
+    sub_class_code: u8,                                  // a
+    base_class_code: u8,                                 // b
+    reserved_0: [u8; 2],                                 // c-d
+    header_type: u8,                                     // e
+    reserved_1: u8,                                      // f
+    native_audio_mixer_base_address: u32,                // 10-13
+    native_bus_mastering_base_address: u32,              // 14-17
+    mixer_base_address: u32,                             // 18-1b
+    bus_master_base_address: u32,                        // 1c-1f
+    reserved_3: [u8; 12],                                // 20-2b
+    subsystem_vendor_information: u16,                   // 2c-2d
+    system_identification: u16,                          // 2e-2f
+    reserved_4: [u8; 4],                                 // 30-33
+    capabilities_pointer: u8,                            // 34
+    reserved_8: [u8; 7],                                 // 35-3b
+    interrupt_line: u8,                                  // 3c
+    interrupt_pin: u8,                                   // 3d
+    reserved_9: [u8; 2],                                 // 3e-3f
+    programmable_codec_id: u8,                           // 40
+    configuration: u8,                                   // 41
+    reserved_10: [u8; 14],                               // 42-4f
+    pci_power_management_capability_id: u16,             // 50-51
+    pc_power_management_capabilities: u16,               // 52-53
+    power_management_control_and_status: u16             // 54-55
 }
 
-static_assert!(mem::size_of::<PciType00>() == 64);
+static_assert!(mem::size_of::<PciType00>() == 0x56);
 
 /// AC'97 baseline audio register set.
 /// Section 5.7, AC'97 specification, r2.3, April 2002.
-///
-/// Note that this struct is supposed to be packed but rustc
-/// complains about unaligned field access and unaligned
-/// references, but with repr(C) this structure is naturally
-/// aligned so that we will only ensure the proper size
-/// with static_assert().
-#[repr(C)]
+#[repr(C, packed)]
 #[derive(Clone, Copy, Debug, Default)]
 struct BaseRegisterSet {
     reset: u16,
@@ -370,34 +382,34 @@ fn init_bdl(mapping: &uefi::proto::pci::Mapping, bdl: &mut BufferDescriptorListW
 
 fn read_register_byte(pci: &PciIO, offset: u64) -> uefi::Result<u8, ()> {
     let value = &mut [0];
-    pci.read_io::<u8>(uefi::proto::pci::IoRegister::R1, offset, value)?;
+    pci.read_io(uefi::proto::pci::IoRegister::R1, offset, value)?;
     Ok(value[0].into())
 }
 
 fn read_register_word(pci: &PciIO, offset: u64) -> uefi::Result<u16, ()> {
     let value = &mut [0];
-    pci.read_io::<u16>(uefi::proto::pci::IoRegister::R1, offset, value)?;
+    pci.read_io(uefi::proto::pci::IoRegister::R1, offset, value)?;
     Ok(value[0].into())
 }
 
 fn read_register_dword(pci: &PciIO, offset: u64) -> uefi::Result<u32, ()> {
     let value = &mut [0];
-    pci.read_io::<u32>(uefi::proto::pci::IoRegister::R1, offset, value)?;
+    pci.read_io(uefi::proto::pci::IoRegister::R1, offset, value)?;
     Ok(value[0].into())
 }
 
 fn write_register_byte(pci: &PciIO, offset: u64, value: u8) -> uefi::Result {
-    pci.write_io::<u8>(uefi::proto::pci::IoRegister::R1, offset, &[value])?;
+    pci.write_io(uefi::proto::pci::IoRegister::R1, offset, &[value])?;
     Ok(().into())
 }
 
 fn write_register_word(pci: &PciIO, offset: u64, value: u16) -> uefi::Result {
-    pci.write_io::<u16>(uefi::proto::pci::IoRegister::R1, offset, &[value])?;
+    pci.write_io(uefi::proto::pci::IoRegister::R1, offset, &[value])?;
     Ok(().into())
 }
 
 fn write_register_dword(pci: &PciIO, offset: u64, value: u32) -> uefi::Result {
-    pci.write_io::<u32>(uefi::proto::pci::IoRegister::R1, offset, &[value])?;
+    pci.write_io(uefi::proto::pci::IoRegister::R1, offset, &[value])?;
     Ok(().into())
 }
 
@@ -410,18 +422,18 @@ fn stereo_volume(left: u16, right: u16, mute: bool) -> u16 {
 }
 
 fn write_mixer_master_register(pci: &PciIO, value: u16) -> uefi::Result {
-    pci.write_io::<u16>(uefi::proto::pci::IoRegister::R0, MIXER_MASTER, &[value])?;
+    pci.write_io(uefi::proto::pci::IoRegister::R0, MIXER_MASTER, &[value])?;
     Ok(().into())
 }
 
 fn read_mixer_master_register(pci: &PciIO) -> uefi::Result<u16, ()> {
     let value = &mut [0];
-    pci.read_io::<u16>(uefi::proto::pci::IoRegister::R0, MIXER_MASTER, value)?;
+    pci.read_io(uefi::proto::pci::IoRegister::R0, MIXER_MASTER, value)?;
     Ok(value[0].into())
 }
 
 fn write_mixer_pcm_out_register(pci: &PciIO, value: u16) -> uefi::Result {
-    pci.write_io::<u16>(uefi::proto::pci::IoRegister::R0, MIXER_PCM_OUT, &[value])?;
+    pci.write_io(uefi::proto::pci::IoRegister::R0, MIXER_PCM_OUT, &[value])?;
     Ok(().into())
 }
 
@@ -452,9 +464,9 @@ fn set_sampling_rate(pci: &PciIO, sampling_rate: u32) -> uefi::Result {
     {
         return uefi::Status::INVALID_PARAMETER.into()
     }
-    pci.write_io::<u16>(uefi::proto::pci::IoRegister::R0, PCM_RATE_FRONT, &[sampling_rate as u16])?;
-    pci.write_io::<u16>(uefi::proto::pci::IoRegister::R0, PCM_RATE_SURROUND, &[sampling_rate as u16])?;
-    pci.write_io::<u16>(uefi::proto::pci::IoRegister::R0, PCM_RATE_LFE, &[sampling_rate as u16])?;
+    pci.write_io(uefi::proto::pci::IoRegister::R0, PCM_RATE_FRONT, &[sampling_rate as u16])?;
+    pci.write_io(uefi::proto::pci::IoRegister::R0, PCM_RATE_SURROUND, &[sampling_rate as u16])?;
+    pci.write_io(uefi::proto::pci::IoRegister::R0, PCM_RATE_LFE, &[sampling_rate as u16])?;
     Ok(().into())
 }
 
@@ -510,16 +522,8 @@ fn dump_pcm_out_registers(pci: &PciIO) -> uefi::Result {
 
 fn dump_global_bar1_registers(pci: &PciIO) -> uefi::Result {
     let global_sts = read_register_dword(pci, GLOBAL_STATUS)
-        .map_err(|error| {
-            error!("read_register_dword GLOBAL_STATUS failed: {:?}", error.status());
-            error
-        })
         .warning_as_error()?;
     let global_ctl = read_register_dword(pci, GLOBAL_CONTROL)
-        .map_err(|error| {
-            error!("read_register_dword GLOBAL_CONTROL failed: {:?}", error.status());
-            error
-        })
         .warning_as_error()?;
     info!("GLOBAL_CONTROL = 0x{:x}, GLOBAL_STATUS = 0x{:x}", global_ctl, global_sts);
     Ok(().into())
@@ -530,13 +534,8 @@ fn wait_word(pci: &PciIO, offset: u64, mask: u16, value: u16) -> uefi::Result {
     loop {
         dump_pcm_out_registers(pci);
         let register = read_register_word(pci, offset)
-            .map_err(|error| {
-                error!("read_register_word {:x} failed: {:?}", offset, error.status());
-                error
-            })
             .warning_as_error()?;
         if (register & mask) == value {
-            info!("wait word -- success");
             return Ok(().into());
         }
         boot_services().stall(20);
@@ -548,13 +547,8 @@ fn wait_byte(pci: &PciIO, timeout: u64, offset: u64, mask: u8, value: u8) -> uef
     let mut time = 0;
     loop {
         let register = read_register_byte(pci, offset)
-            .map_err(|error| {
-                error!("read_register_byte {:x} failed: {:?}", offset, error.status());
-                error
-            })
             .warning_as_error()?;
         if (register & mask) == value {
-            info!("wait byte -- success");
             return Ok(().into());
         }
         boot_services().stall(20);
@@ -569,10 +563,6 @@ fn wait_end_of_transfer(pci: &PciIO) -> uefi::Result {
     info!("wait end of transfer");
     loop {
         let buffer_cnt = read_register_byte(pci, CONTROL_PCM_OUT)
-            .map_err(|error| {
-                error!("read_register_byte CONTROL_PCM_OUT failed: {:?}", error.status());
-                error
-            })
             .warning_as_error()?;
         if (buffer_cnt & CONTROL_RESET_BIT) == 0 {
             return Ok(().into());
@@ -1018,10 +1008,10 @@ extern "efiapi" fn pcm_supported(this: &DriverBinding, handle: Handle, remaining
     info!("pcm_supported -- got PCI");
     pci.with_proto(|pci| {
         let mut type00: PciType00 = Default::default();
-        // SAFETY: TBD
+        // SAFETY: creating multiple mutable references to type00 is not good but safe
         let buffer = unsafe {
             core::slice::from_raw_parts_mut(
-                &mut type00 as *mut PciType00 as *mut u8,
+                core::ptr::addr_of!(type00) as *mut u8,
                 mem::size_of::<PciType00>())
         };
         pci.read_config::<u8>(0, buffer)
@@ -1030,7 +1020,7 @@ extern "efiapi" fn pcm_supported(this: &DriverBinding, handle: Handle, remaining
                 error
             })
             .warning_as_error()?;
-        info!("vendor: {:#x}, device: {:#x}", type00.vendor_id, type00.device_id);
+        info!("vendor: {:#x}, device: {:#x}", {type00.vendor_id}, {type00.device_id});
         let supported = {
             [
                 (VID_INTEL, 0x2415), // Intel 82801AA (ICH) integrated AC'97 Controller
@@ -1226,7 +1216,7 @@ extern "efiapi" fn pcm_unload(image_handle: Handle) -> Status {
 fn efi_main(handle: uefi::Handle, system_table: SystemTable<Boot>) -> uefi::Status {
     efi_dxe::init(handle, &system_table)
         .warning_as_error()?;
-    info!("efi_main");
+    info!("pcm_main");
     // TBD: allocate in runtime pool or .bss
     let driver_binding = Box::new(DriverBinding::new(
         pcm_start,
@@ -1258,6 +1248,6 @@ fn efi_main(handle: uefi::Handle, system_table: SystemTable<Boot>) -> uefi::Stat
     boot_services()
         .handle_protocol::<DriverBinding>(handle)
         .warning_as_error()?;
-    info!("efi_main -- ok");
+    info!("pcm_main -- ok");
     uefi::Status::SUCCESS
 }
