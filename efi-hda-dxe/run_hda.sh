@@ -19,7 +19,6 @@ popd
 # ./build.sh
 # popd
 
-
 cp ./../efi-pcm-dxe/target/x86_64-unknown-uefi/debug/efi-pcm-dxe.efi hda
 cp ./../efi-hda-dxe/target/x86_64-unknown-uefi/debug/efi-hda-dxe.efi hda
 cp ./../efi-pcm-test/target/x86_64-unknown-uefi/debug/efi-pcm-test.efi hda
@@ -28,6 +27,16 @@ cp ~/edk2/Build/RustTestPkg/DEBUG_GCC5/X64/Launcher.efi hda
     # -soundhw hda
 
     # -device intel-hda
+
+# -device intel-hda,debug=255
+
+# -audiodev pa,id=hda,server=unix:/tmp/pulse-socket
+
+    # -device intel-hda,debug=255 \
+    # -device hda-micro,debug=255
+
+
+    # -audiodev pa,id=audiodev-0,timer-period=1000,in.buffer-length=3000,out.buffer-length=3000 \
 
 qemu-system-x86_64 \
     -machine q35 \
@@ -41,4 +50,5 @@ qemu-system-x86_64 \
     -s \
     -serial file:serial.txt \
     -serial stdio \
-    -device ich9-intel-hda
+    -device ich9-intel-hda,debug=255 \
+    -device hda-micro,debug=255

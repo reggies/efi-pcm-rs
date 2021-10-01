@@ -104,25 +104,25 @@ fn test_cracks(audio_out: &mut SimpleAudioOut) -> uefi::Result {
 fn efi_main(_handle: uefi::Handle, system_table: SystemTable<Boot>) -> uefi::Status {
     uefi_services::init(&system_table)
         .expect_success("this is only the beginning");
-    info!("efi_main");
+    info!("test_main");
     connect::connect_pci_recursively();
     connect::enum_simple_audio_out();
-    info!("efi_main -- ok");
     let bt = unsafe { uefi_services::system_table().as_ref().boot_services() };
     let audio_out = bt
         .locate_protocol::<SimpleAudioOut>()
         .log_warning()?;
     let audio_out = unsafe { &mut *audio_out.get() };
-    let data = unsafe { core::mem::transmute(data::TEST_DATA) };
-    audio_out.reset()
-        .warning_as_error()?;
-    audio_out.write(efi_pcm::AUDIO_RATE_22050, 2, efi_pcm::AUDIO_FORMAT_S16LE, data)
-        .map_err(|error| {
-            error!("pcm write failed: {:?}", error.status());
-            error
-        })
-        .warning_as_error()?;
-    // test_tone(audio_out).warning_as_error()?;
+    // let data = unsafe { core::mem::transmute(data::TEST_DATA) };
+    // audio_out.reset()
+    //     .warning_as_error()?;
+    // audio_out.write(efi_pcm::AUDIO_RATE_22050, 2, efi_pcm::AUDIO_FORMAT_S16LE, data)
+    //     .map_err(|error| {
+    //         error!("pcm write failed: {:?}", error.status());
+    //         error
+    //     })
+    //     .warning_as_error()?;
+    test_tone(audio_out).warning_as_error()?;
     // test_cracks(audio_out).warning_as_error()?;
+    info!("test_main -- ok");
     uefi::Status::SUCCESS
 }
