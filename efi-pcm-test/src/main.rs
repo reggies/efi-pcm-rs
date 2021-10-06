@@ -84,7 +84,7 @@ fn test_tone(audio_out: &mut SimpleAudioOut) -> uefi::Result {
 
     for &(freq, duration) in SAMPLES {
         audio_out.tone(freq, duration)
-            .log_warning()?;
+            .ignore_warning()?;
     }
 
     Ok(().into())
@@ -108,21 +108,25 @@ fn efi_main(_handle: uefi::Handle, system_table: SystemTable<Boot>) -> uefi::Sta
     connect::connect_pci_recursively();
     connect::enum_simple_audio_out();
     let bt = unsafe { uefi_services::system_table().as_ref().boot_services() };
-    let audio_out = bt
-        .locate_protocol::<SimpleAudioOut>()
-        .log_warning()?;
-    let audio_out = unsafe { &mut *audio_out.get() };
-    // let data = unsafe { core::mem::transmute(data::TEST_DATA) };
-    // audio_out.reset()
-    //     .warning_as_error()?;
-    // audio_out.write(efi_pcm::AUDIO_RATE_22050, 2, efi_pcm::AUDIO_FORMAT_S16LE, data)
-    //     .map_err(|error| {
-    //         error!("pcm write failed: {:?}", error.status());
-    //         error
-    //     })
-    //     .warning_as_error()?;
-    test_tone(audio_out).warning_as_error()?;
-    // test_cracks(audio_out).warning_as_error()?;
+    let audio_out_handles = bt.find_handles::<SimpleAudioOut>()
+        .ignore_warning()?;
+    for audio_out_handle in audio_out_handles.into_iter() {
+        let audio_out = bt
+            .handle_protocol::<SimpleAudioOut>(audio_out_handle)
+            .ignore_warning()?;
+        let audio_out = unsafe { &mut *audio_out.get() };
+        // let data = unsafe { core::mem::transmute(data::TEST_DATA) };
+        // audio_out.reset()
+        //     .warning_as_error()?;
+        // audio_out.write(efi_pcm::AUDIO_RATE_22050, 2, efi_pcm::AUDIO_FORMAT_S16LE, data)
+        //     .map_err(|error| {
+        //         error!("pcm write failed: {:?}", error.status());
+        //         error
+        //     })
+        //     .warning_as_error()?;
+        test_tone(audio_out).warning_as_error()?;
+        // test_cracks(audio_out).warning_as_error()?;
+    }
     info!("test_main -- ok");
     uefi::Status::SUCCESS
 }
