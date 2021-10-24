@@ -12,8 +12,9 @@ panic = "abort"
 panic = "abort"
 
 [dependencies]
-uefi = { path = "../../uefi-rs", features = ['exts', 'logger', 'alloc'] }
-uefi-services = { path = "../../uefi-rs/uefi-services" }
-uefi-macros = { path = "../../uefi-rs/uefi-macros" }
+uefi = { git = "ssh://git@github.com/reggies/uefi-rs", features = ['exts', 'logger', 'alloc'] }
+uefi-macros = { git = "ssh://git@github.com/reggies/uefi-rs" }
+uefi-services = { git = "ssh://git@github.com/reggies/uefi-rs" }
+
 log = { version = "0.4.11", default-features = false }
 efi-pcm = { path = "../efi-pcm" }

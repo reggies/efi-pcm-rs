@@ -10,7 +10,7 @@ panic = "abort"
 panic = "abort"
 
 [dependencies]
-# uefi = { version = "0.11.0", features = ['exts', 'logger', 'alloc'] }
-uefi = { path = "../../uefi-rs", features = ['exts', 'logger', 'alloc'] }
-uefi-macros = { path = "../../uefi-rs/uefi-macros" }
+uefi = { git = "ssh://git@github.com/reggies/uefi-rs", features = ['exts', 'logger', 'alloc'] }
+uefi-macros = { git = "ssh://git@github.com/reggies/uefi-rs" }
+
 log = { version = "0.4.11", default-features = false }
