@@ -1,0 +1,16 @@
+* TODO simplify hda_write by playing with CBL size
+* TODO properly report all supported pcm formats
+* TODO test C app
+* TODO codec hotplug
+* TODO parse pin widgets, unmute only DACs that are on the headphones paths if any
+* TODO implement CORB/RIRB
+* TODO add ComponentName, ComponentName2 and DevicePath
+* TODO add install_multiple_protocol_interfaces()
+* TODO add volume control
+ - DriverConfiguration would be great
+* TODO add asynchronous API
+* TODO add sound capture
+* TODO add protocol for bus link controller
+* TODO qemu does not recognize 0x34 register (ich6 ssync). wtf?
+* TODO check 3.1.3 Behavior With 64-bit Addresses to
+     - determine 64-bit support
