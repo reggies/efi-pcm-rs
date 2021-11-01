@@ -1,6 +1,5 @@
 * TODO simplify hda_write by playing with CBL size
 * TODO properly report all supported pcm formats
-* TODO test C app
 * TODO codec hotplug
 * TODO parse pin widgets, unmute only DACs that are on the headphones paths if any
 * TODO implement CORB/RIRB
