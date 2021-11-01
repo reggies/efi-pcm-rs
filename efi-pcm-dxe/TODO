@@ -1,43 +1,11 @@
-* Top
-** still possible to interrupt pcm_tone/pcm_write by ExitBootServices notification
-** OpenProtocol::with_proto is bullshit
-** PCI memory buffer mapping is duplicated
-** uefi::table::boot::leak vs core::mem::forget vs uefi::table::boot::OpenProtocol::dont_close
-** DONE look at snd_pcm_writei() from alsa
-   - usage code
-     pcm = alsaaudio.PCM(alsaaudio.PCM_PLAYBACK, alsaaudio.PCM_NORMAL)
-     pcm.setrate(44100)
-     pcm.setchannels(2)
-     pcm.setperiodsize(1000)
-     pcm.setformat(alsaaudio.PCM_FORMAT_S16_LE)
-   - [X] what is alsaaudio.PCM
-     - [X] what is alsaaudio.PCM_PLAYBACK
-       - type; either capture or playback
-     - [X] what is alsaaudio.PCM_NORMAL
-       - mode; either nonblock or normal
-   - [X] what is outp.setperiodsize(1920)
-     - measured in hz; a size of the buffer we feed into DMA or a delay of the picb timer
-* Bottom
-** TODO ComponentName and ComponentName2
-** TODO qemu-ac97 + apic + IOC = interrupt not fired; why?
-** TODO port the driver to SMM
-** TODO extend the API for other PCM formats, sampling rates, channel count and volume
-** TODO understand how OpenCorePkg represents audio data and audio protocols
-   - BeepGen -- done
-   - PlayTone -- same as BeepGen but for HDA
-   - VoiceOver -- opaque
-** TODO link scripts for global objects
-* WONTFIX using BOX across FFI is UB
-  - this is not true:
-    - Box<T> is guaranteed to have the same layout as *const T which for T: Sized types is guaranteed t have the same layout as C-lang pointer.
-    - it seems that this also holds for non Sized-marked T-types
-* DONE implement tone
-* DONE amplitude of samples of isine()
-  - [SHORT_MIN..SHORT_MAX] seems reasonable and working good. there was a problem with endianness of data
-* DONE proper sample scheduling with no lost frames
-** DONE in particular proper timer intervals
-* DONE unload crash when exit from shell
-  - didn't I fix this?
-* DONE implement feed
-  - AC97 bus master registers and slots
-    - https://wiki.osdev.org/AC97#Native_Audio_Bus_Master_registers
+* pcm_tone() and pcm_write() are not ready for the ExitBootServices notification arrival
+* OpenProtocol::with_proto is not worth it
+* PCI memory buffer mapping is duplicated
+* uefi::table::boot::leak vs core::mem::forget vs uefi::table::boot::OpenProtocol::dont_close
+* ComponentName and ComponentName2
+* qemu-ac97 + apic + IOC = interrupt not fired; why?
+   - at least unset the IOC bit so the playback wont stuck
+     for non-qemu systems
+* port the driver to SMM
+* extend the API for other PCM formats, sampling rates, channel count and volume
+* link scripts for global objects
