@@ -53,6 +53,7 @@ use core::str;
 use core::fmt::*;
 use core::mem;
 use alloc::boxed::*;
+use core::pin::Pin;
 
 use efi_dxe::*;
 use efi_pcm::*;
@@ -443,7 +444,7 @@ struct DeviceContext {
     controller_handle: Handle,
     child_handle: Handle,
     driver_handle: Handle,
-    audio_interface: SimpleAudioOut,
+    audio_interface: Pin<Box<SimpleAudioOut>>,
     in_streams: u32,
     out_streams: u32,
     codec: Codec,
@@ -511,7 +512,7 @@ impl DeviceContext {
                 .as_ref()
                 .and_then(|contexts| {
                     contexts.iter().find(|&context| {
-                        &context.audio_interface as *const SimpleAudioOut == raw
+                        &*context.audio_interface as *const SimpleAudioOut == raw
                     })
                 })
                 .map(|context| {
@@ -527,7 +528,7 @@ impl DeviceContext {
                 .as_deref_mut()
                 .and_then(|contexts| {
                     contexts.iter_mut().find(|context| {
-                        &context.audio_interface as *const SimpleAudioOut == raw as *const SimpleAudioOut
+                        & *context.audio_interface as *const SimpleAudioOut == raw as *const SimpleAudioOut
                     })
                 })
                 .map(|context| {
@@ -1707,14 +1708,14 @@ fn init_context(driver_handle: Handle, controller_handle: Handle, pci: &PciIO, c
         in_streams: gcap.in_streams as u32,
         out_streams: gcap.out_streams as u32,
         codec,
-        audio_interface: SimpleAudioOut {
+        audio_interface: Pin::new(Box::new(SimpleAudioOut {
             reset: hda_reset,
             write: hda_write,
             tone: hda_tone,
             query_mode: hda_query_mode,
             max_mode: 1,
             capabilities: AUDIO_CAP_RESET | AUDIO_CAP_WRITE | AUDIO_CAP_TONE | AUDIO_CAP_MODE
-        }
+        }))
     });
     Ok (device.into())
 }
@@ -1919,7 +1920,7 @@ extern "efiapi" fn hda_start(this: &DriverBinding, controller_handle: Handle, re
 fn bus_create_child(driver_handle: Handle, controller_handle: Handle, pci: &PciIO, codec: Codec) -> uefi::Result {
     let mut device = init_context(driver_handle, controller_handle, pci, codec)
         .ignore_warning()?;
-    let audio_out = &device.audio_interface;
+    let audio_out = &*device.audio_interface;
     let child_handle = boot_services()
         .create_child::<SimpleAudioOut>(audio_out)
         .map_err(|error| {
