@@ -49,6 +49,8 @@ use uefi::proto::pci::PciIO;
 use uefi::table::boot::OpenAttribute;
 use uefi::table::boot::BootServices;
 
+use core::ops::{Deref, DerefMut};
+
 use core::str;
 use core::fmt::*;
 use core::mem;
@@ -482,9 +484,18 @@ impl<'a> PciMappingGuard<'a> {
             mapping: Some(mapping)
         }
     }
+}
 
-    fn unwrap(&self) -> &uefi::proto::pci::Mapping {
+impl<'a> Deref for PciMappingGuard<'a> {
+    type Target = uefi::proto::pci::Mapping;
+    fn deref(&self) -> &Self::Target {
         self.mapping.as_ref().unwrap()
+    }
+}
+
+impl<'a> DerefMut for PciMappingGuard<'a> {
+    fn deref_mut(&mut self) -> &mut uefi::proto::pci::Mapping {
+        self.mapping.as_mut().unwrap()
     }
 }
 
@@ -1522,9 +1533,8 @@ impl<'a> DmaControl for Loop<'a> {
 }
 
 fn stream_play_loop(device: &mut DeviceContext, pci: &PciIO, duration: u64, samples: &[i16], sampling_rate: u32, channel_count: u8) -> uefi::Result {
-    let mut bdl = Box::<BufferDescriptorListWithBuffers>::new_uninit();
+    let bdl = Box::<BufferDescriptorListWithBuffers>::new_uninit();
     let mut bdl = unsafe { bdl.assume_init() };
-    let mut bdl = &mut *bdl;
 
     let bdl_dma = pci
         .map(
@@ -1534,23 +1544,23 @@ fn stream_play_loop(device: &mut DeviceContext, pci: &PciIO, duration: u64, samp
         .map_err(|error| {error!("map operation failed: {:?}", error.status()); error})
         .ignore_warning()?;
     // Drop will unmap the memory buffer for us
-    let bdl_dma = PciMappingGuard::wrap(pci, bdl_dma);
+    let mut bdl_dma = PciMappingGuard::wrap(pci, bdl_dma);
 
     let (format, closest_rate) = stream_select_rate(device, pci, sampling_rate, channel_count)
         .ignore_warning()?;
 
     info!("stream_play_loop: use {} sample rate", closest_rate);
 
-    init_bdl(bdl_dma.unwrap(), bdl);
+    init_bdl(&bdl_dma, &mut *bdl);
 
     let loop_buffers = BUFFER_COUNT;
     let loop_samples = BUFFER_COUNT * BUFFER_SIZE;
 
-    let mut control = Loop::new(bdl, samples);
+    let mut control = Loop::new(&mut *bdl, samples);
 
     // TBD: reset the stream? we could only modify CBL after _some_ reset
     codec_setup_stream(device, pci, device.codec, format)?;
-    stream_setup(device, pci, bdl_dma.unwrap(), loop_buffers as u32, loop_samples as u32, format)?;
+    stream_setup(device, pci, &bdl_dma, loop_buffers as u32, loop_samples as u32, format)?;
 
     stream_loop(device, pci, &mut control, samples.len() as u64, channel_count as u64, sampling_rate as u64, duration as u64)
         .map_err(|error| {
