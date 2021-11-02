@@ -41,6 +41,7 @@ impl<T> IoBase<T> where
                 return Ok(().into());
             }
             boot_services().stall(100);
+            // TBD: check overflow
             time += 100;
             if time >= timeout {
                 return Err (uefi::Status::TIMEOUT.into());
