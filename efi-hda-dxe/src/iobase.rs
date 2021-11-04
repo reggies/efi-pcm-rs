@@ -1,5 +1,5 @@
 use core::marker::PhantomData;
-use core::ops::{BitAnd, BitOr};
+use core::ops::{BitAnd, BitOr, Not};
 use uefi::proto::pci::PciIO;
 use uefi::prelude::*;
 use uefi::table::boot::BootServices;
@@ -17,7 +17,7 @@ impl<T: Copy + Clone + Default + uefi::proto::pci::ToIoWidth> IoBase<T> {
         IoBase {offset: offset as u64, width: PhantomData}
     }
 
-    pub fn read(&self, pci: &PciIO) -> uefi::Result<T, ()> {
+    pub fn read(&self, pci: &PciIO) -> uefi::Result<T> {
         let value = &mut [Default::default()];
         pci.read_mem::<T>(uefi::proto::pci::IoRegister::R0, self.offset, value)
             .ignore_warning()?;
@@ -63,5 +63,13 @@ impl<T> IoBase<T> where
     pub fn or(&self, pci: &PciIO, mask: T) -> uefi::Result {
         let value = self.read(pci).ignore_warning()?;
         self.write(pci, value | mask)
+    }
+}
+
+impl<T> IoBase<T> where
+    T: Copy + Clone + BitAnd<Output=T> + BitOr<Output=T> + Not<Output=T> + uefi::proto::pci::ToIoWidth + Default {
+    pub fn update(&self, pci: &PciIO, value: T, mask: T) -> uefi::Result {
+        let v = self.read(pci).ignore_warning()?;
+        self.write(pci, (v & !mask) | (value & mask))
     }
 }

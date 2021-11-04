@@ -56,6 +56,7 @@ use core::fmt::*;
 use core::mem;
 use alloc::boxed::*;
 use core::pin::Pin;
+use core::sync::atomic;
 
 use efi_dxe::*;
 use efi_pcm::*;
@@ -194,6 +195,9 @@ const PCI_CORBCTL_CMEI_BIT: u8 = BIT0 as u8;
 const PCI_CORBCTL_DMA_BIT: u8 = BIT1 as u8;
 const PCI_CORBRP_RST_BIT: u16 = BIT15 as u16;
 const PCI_CORBBASE_MASK: u32 = bitspan(31, 7) as u32;
+const PCI_CORBSIZE_RSVDP_MASK: u8 = bitspan(3, 2) as u8;
+const PCI_CORBWP_RSVDP_MASK: u16 = bitspan(15, 8) as u16;
+const PCI_CORBSIZE_SZCAP_MASK: u8 = bitspan(7, 4) as u8;
 const PCI_GCTL_RST_BIT: u32 = BIT0;
 const PCI_GCTL_UNSOLICITED_BIT: u32 = BIT8;
 const PCI_SDCTL8_STREAM_MASK: u8 = (BIT7 | BIT6 | BIT5 | BIT4) as u8;
@@ -218,7 +222,9 @@ const PCI_RIRBSTS_INT_MASK: u8 = (BIT0 | BIT2) as u8;
 const PCI_RIRBSTS_OVERRUN_BIT: u8 = BIT2 as u8;
 const PCI_RIRBSTS_RESPONSE_BIT: u8 = BIT0 as u8;
 const PCI_RIRBWP_RST_BIT: u16 = BIT15 as u16;
+const PCI_RIRBWP_RSVDP_MASK: u16 = bitspan(14, 8) as u16;
 const PCI_RINTCNT_RSVDP_MASK: u16 = bitspan(15, 8) as u16;
+const PCI_RIRBSIZE_RSVDP_MASK: u8 = bitspan(3, 2) as u8;
 const PCI_STATESTS_INT_MASK: u16 = (BIT0 | BIT1 | BIT2) as u16;
 const PCI_STATESTS_SDI0_BIT: u16 = BIT0 as u16;
 const PCI_STATESTS_SDI1_BIT: u16 = BIT1 as u16;
@@ -228,6 +234,16 @@ const PCI_SDLVI_RSVDP_MASK: u16 = bitspan(15, 8) as u16;
 const PCI_SDFMT_RSVDP_MASK: u16 = BIT7 as u16;
 const PCI_IRS_ICB_BIT: u16 = BIT0 as u16;
 const PCI_IRS_IRV_BIT: u16 = BIT1 as u16;
+
+const PCI_RIRB_EX_UNSOLICITED_BIT: u32 = BIT4;
+
+const PCI_CORBSIZE_CAP_2_BIT: u8 = BIT4 as u8;
+const PCI_CORBSIZE_CAP_16_BIT: u8 = BIT5 as u8;
+const PCI_CORBSIZE_CAP_256_BIT: u8 = BIT6 as u8;
+
+const PCI_RIRBSIZE_CAP_2_BIT: u8 = BIT4 as u8;
+const PCI_RIRBSIZE_CAP_16_BIT: u8 = BIT5 as u8;
+const PCI_RIRBSIZE_CAP_256_BIT: u8 = BIT6 as u8;
 
 const PCI_SDCTL8_STREAM_1_MASK: u8 = 1 << 4;
 const PCI_SDCTL8_STREAM_2_MASK: u8 = 2 << 4;
@@ -573,13 +589,12 @@ fn unregister_device_context(device: &DeviceContext) {
 }
 
 fn bus_trace_registers(pci: &PciIO) -> uefi::Result {
-    let rintcnt = RINTCNT.read(pci).ignore_warning()?;
     let gctl = GCTL.read(pci).ignore_warning()?;
     let statests = STATESTS.read(pci).ignore_warning()?;
     let intsts = INTSTS.read(pci).ignore_warning()?;
     let ssync = SSYNC.read(pci).ignore_warning()?;
-    info!("GCTL:{:#010x} STATESTS:{:#010x} INTSTS:{:#010x} RINTCNT:0n{:08} SSYNC:{:#010x}",
-          gctl, statests, intsts, rintcnt, ssync);
+    info!("GCTL:{:#010x} STATESTS:{:#010x} INTSTS:{:#010x} SSYNC:{:#010x}",
+          gctl, statests, intsts, ssync);
     uefi::Status::SUCCESS.into()
 }
 
@@ -695,7 +710,268 @@ fn bus_reset_link(pci: &PciIO) -> uefi::Result<u16> {
     Ok(codec_mask.into())
 }
 
-fn bus_exec(pci: &PciIO, cmd: u32) -> uefi::Result<u32> {
+trait BusIo {
+    fn exec(&mut self, cmd: u32) -> uefi::Result<u32>;
+}
+
+#[repr(C, align(128))]
+struct CommandRing {
+    slots: [u32; 256]
+}
+
+#[derive(Copy, Clone, Debug)]
+#[repr(C, packed)]
+struct ResponseEntry {
+    result: u32,
+    response_ex: u32
+}
+
+impl ResponseEntry {
+    fn new() -> ResponseEntry {
+        ResponseEntry {
+            result: 0,
+            response_ex: 0
+        }
+    }
+}
+
+#[repr(C, align(128))]
+struct ResponseRing {
+    slots: [ResponseEntry; 256]
+}
+
+struct CommandResponseBuffers<'a> {
+    command_ring: Pin<Box<CommandRing>>,
+    response_ring: Pin<Box<ResponseRing>>,
+    read_pos: usize,
+    pci: &'a PciIO,
+    corb_dma: Option<PciMappingGuard<'a>>,
+    rirb_dma: Option<PciMappingGuard<'a>>,
+}
+
+impl<'a> Drop for CommandResponseBuffers<'a> {
+    fn drop(&mut self) {
+        if let Err(error) = self.uninit_io() {
+            warn!("failed to stop CORB/RIRB I/O: {:?}", error.status());
+        }
+        self.corb_dma.take();
+        self.rirb_dma.take();
+    }
+}
+
+impl<'a> CommandResponseBuffers<'a> {
+    fn new(pci: &'a PciIO) -> uefi::Result<CommandResponseBuffers<'a>> {
+        let mut crb = CommandResponseBuffers {
+            command_ring: Box::pin(CommandRing {
+                slots: [0; 256]
+            }),
+            response_ring: Box::pin(ResponseRing {
+                slots: [ResponseEntry::new(); 256]
+            }),
+            read_pos: 0,
+            corb_dma: None,
+            rirb_dma: None,
+            pci
+        };
+        crb.init_io()
+            .map_err(|error| {
+                error!("failed to initialize CORB/RIRB interface: {:?}", error.status());
+                error
+            })?;
+        Ok(crb.into())
+    }
+
+    fn trace(&self) -> uefi::Result {
+        let corbwp = CORBWP.read(self.pci).ignore_warning()?;
+        let corbrp = CORBRP.read(self.pci).ignore_warning()?;
+        let corbctl = CORBCTL.read(self.pci).ignore_warning()?;
+        let corbst = CORBST.read(self.pci).ignore_warning()?;
+        let corbsize = CORBSIZE.read(self.pci).ignore_warning()?;
+        let rirbwp = RIRBWP.read(self.pci).ignore_warning()?;
+        let rirbctl = RIRBCTL.read(self.pci).ignore_warning()?;
+        let rirbsts = RIRBSTS.read(self.pci).ignore_warning()?;
+        let rirbsize = RIRBSIZE.read(self.pci).ignore_warning()?;
+        let rintcnt = RINTCNT.read(self.pci).ignore_warning()?;
+        info!("CORBRP:{:#06x} CORBWP:{:#06x} CORBCTL:{:#06x} CORBST:{:#06x} CORBSZ:{:#04x} RIRBWP:{:#06x} RIRBCTL:{:#06x} RIRBST:{:#04x} RIRBSZ:{:#04x} RINTCNT:{:#06x}",
+              corbrp, corbwp, corbctl, corbst, corbsize, rirbwp, rirbctl, rirbsts, rirbsize, rintcnt);
+        Ok(().into())
+    }
+
+    fn init_io(&mut self) -> uefi::Result {
+        let corb = self.pci
+            .map(
+                uefi::proto::pci::IoOperation::BusMasterWrite,
+                &mut *self.command_ring as *mut CommandRing as *mut _,
+                mem::size_of::<CommandRing>())
+            .map_err(|error| {
+                error!("corb: pci map returned {:?}", error.status());
+                error
+            })
+            .ignore_warning()?;
+        // Drop will unmap the memory buffer for us
+        let corb = PciMappingGuard::wrap(self.pci, corb);
+        let rirb = self.pci
+            .map(
+                uefi::proto::pci::IoOperation::BusMasterWrite,
+                &mut *self.response_ring as *mut ResponseRing as *mut _,
+                mem::size_of::<ResponseRing>())
+            .map_err(|error| {
+                error!("rirb: pci map returned {:?}", error.status());
+                error
+            })
+            .ignore_warning()?;
+        // Drop will unmap the memory buffer for us
+        let rirb = PciMappingGuard::wrap(self.pci, rirb);
+        if (corb.device_address() & 0b1111111) != 0 {
+            error!("CORB address {:#x} is not supported", corb.device_address());
+            return Err(uefi::Status::UNSUPPORTED.into());
+        }
+        if (rirb.device_address() & 0b1111111) != 0 {
+            error!("RIRB address {:#x} is not supported", corb.device_address());
+            return Err(uefi::Status::UNSUPPORTED.into());
+        }
+        let corbszcap = CORBSIZE.read(self.pci)
+            .ignore_warning()?;
+        if (corbszcap & PCI_CORBSIZE_CAP_256_BIT) == 0 {
+            error!("CORB size capabilities are not supported: {:#x}", corbszcap);
+            return Err(uefi::Status::UNSUPPORTED.into());
+        }
+        let rirbszcap = RIRBSIZE.read(self.pci).ignore_warning()?;
+        if (rirbszcap & PCI_RIRBSIZE_CAP_256_BIT) == 0 {
+            error!("RIRB size capabilities are not supported: {:#x}", rirbszcap);
+            return Err(uefi::Status::UNSUPPORTED.into());
+        }
+        // Ensure that CORBCTL_DMA=0 and RIRBCTL_DMA=0
+        CORBCTL.wait(self.pci, 1000, PCI_CORBCTL_DMA_BIT, 0)
+            .map_err(|e| {error!("wait CORBCTL.DMA=0: {:?}", e.status()); e})?;
+        RIRBCTL.wait(self.pci, 1000, PCI_RIRBCTL_DMA_BIT, 0)
+            .map_err(|e| {error!("wait RIRBCTL.DMA=0: {:?}", e.status()); e})?;
+        // Program the CORB base address
+        CORBLBASE.write(self.pci, (corb.device_address() & 0xffff_ffff) as u32)?;
+        CORBUBASE.write(self.pci, ((corb.device_address() >> 32) & 0xffff_ffff) as u32)?;
+        // Wrap around at 1Kib = 256 entries
+        CORBSIZE.update(self.pci, 0b10, !PCI_CORBSIZE_RSVDP_MASK)?;
+        // Reset the read pointer
+        CORBRP.or(self.pci, PCI_CORBRP_RST_BIT)?;
+        CORBRP.wait(self.pci, 1000, PCI_CORBRP_RST_BIT, PCI_CORBRP_RST_BIT)
+            .map_err(|e| {error!("wait CORBRP.RST=1: {:?}", e.status()); e})?;
+        CORBRP.and(self.pci, !PCI_CORBRP_RST_BIT)?;
+        CORBRP.wait(self.pci, 1000, PCI_CORBRP_RST_BIT, 0)
+            .map_err(|e| {error!("wait CORBRP.RST=0: {:?}", e.status()); e})?;
+        // Reset the write pointer
+        CORBWP.update(self.pci, 0, !PCI_CORBWP_RSVDP_MASK)?;
+        CORBCTL.or(self.pci, PCI_CORBCTL_DMA_BIT)?;
+        // Program the RIRB base address
+        RIRBLBASE.write(self.pci, (rirb.device_address() & 0xffff_ffff) as u32)?;
+        RIRBUBASE.write(self.pci, ((rirb.device_address() >> 32) & 0xffff_ffff) as u32)?;
+        // Wrap around at 2Kib = 256 entries
+        RIRBSIZE.update(self.pci, 0b10, !PCI_RIRBSIZE_RSVDP_MASK)?;
+        // Reset RIRB write pointer
+        RIRBWP.update(self.pci, PCI_RIRBWP_RST_BIT, !PCI_RIRBWP_RSVDP_MASK)?;
+        // TBD: qemu-2.11 does not process CORB without IRQ bit or with RINTCNT=0
+        RINTCNT.update(self.pci, 0x1, !PCI_RINTCNT_RSVDP_MASK)?;
+        RIRBCTL.or(self.pci, PCI_RIRBCTL_DMA_BIT | PCI_RIRBCTL_IRQ_BIT)?;
+        self.corb_dma = Some(corb);
+        self.rirb_dma = Some(rirb);
+        Ok(().into())
+    }
+
+    fn uninit_io(&mut self) -> uefi::Result {
+        RIRBCTL.and(self.pci, !PCI_RIRBCTL_DMA_BIT)?;
+        CORBCTL.and(self.pci, !PCI_CORBCTL_DMA_BIT)?;
+        RIRBCTL.wait(self.pci, 1000, PCI_RIRBCTL_DMA_BIT, 0)?;
+        CORBCTL.wait(self.pci, 1000, PCI_CORBCTL_DMA_BIT, 0)?;
+        Ok(().into())
+    }
+
+    fn send(&mut self, cmd: u32) -> uefi::Result {
+        let corbwp = CORBWP.read(self.pci)
+            .ignore_warning()?;
+        let next_corbwp = (corbwp as usize + 1) % self.command_ring.slots.len();
+        let corbrp = CORBRP.read(self.pci)
+            .ignore_warning()?;
+        if next_corbwp == corbrp as usize {
+            return Err(uefi::Status::NOT_READY.into());
+        }
+        self.command_ring.slots[next_corbwp] = cmd;
+        CORBWP.write(self.pci, next_corbwp as u16)?;
+        Ok(().into())
+    }
+
+    fn poll_rirb(&mut self) -> uefi::Result<ResponseEntry> {
+        let rirbwp = RIRBWP.read(self.pci).ignore_warning()?;
+        if rirbwp as usize == self.read_pos {
+            return Err(uefi::Status::NOT_READY.into());
+        }
+        self.read_pos = (self.read_pos + 1) % self.response_ring.slots.len();
+        // sync response_ring and command_ring
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        let entry = self.response_ring.slots[self.read_pos];
+        if (entry.response_ex & PCI_RIRB_EX_UNSOLICITED_BIT) != 0 {
+            error!("Got unsolicited event even though not requested!");
+            return Err(uefi::Status::DEVICE_ERROR.into());
+        }
+        // Clear interrupt bit because qemu refuses to
+        // process CORB without response control interrupt
+        // and we don't have proper interrupt routine.
+        RIRBSTS.or(self.pci, PCI_RIRBSTS_RESPONSE_BIT)?;
+        Ok(entry.into())
+    }
+
+    fn recv(&mut self) -> uefi::Result<u32> {
+        let timeout_event = boot_services()
+            .create_timer_event()
+            .ignore_warning()
+            .map(EventGuard::wrap)?;
+        boot_services()
+            .set_timer(
+                *timeout_event,
+                uefi::table::boot::TimerTrigger::Relative(milliseconds_to_timer_period(100)))?;
+        loop {
+            // An error is most likely due to RIRB read
+            // pointer did not move. This can be caused by
+            // fact that response is not yet ready, or a
+            // non-existant codec has been addressed or an
+            // interrupt bit was asserted and the DMA engine
+            // stuck waiting for it to be deasserted.
+            if let Ok(ResponseEntry {result, ..}) = self.poll_rirb().ignore_warning() {
+                return Ok(result.into());
+            }
+            boot_services().stall(20);
+            if let Ok(..) = boot_services().check_event(*timeout_event) {
+                break;
+            }
+        }
+        Err(uefi::Status::TIMEOUT.into())
+    }
+}
+
+impl<'a> BusIo for CommandResponseBuffers<'a> {
+    fn exec(&mut self, cmd: u32) -> uefi::Result<u32> {
+        self.send(cmd)?;
+        self.recv()
+    }
+}
+
+struct Immediate<'a> {
+    pci: &'a PciIO
+}
+
+impl<'a> Immediate<'a> {
+    fn new(pci: &'a PciIO) -> uefi::Result<Immediate<'a>> {
+        Ok(Immediate {
+            pci
+        }.into())
+    }
+}
+
+impl<'a> BusIo for Immediate<'a> {
+    fn exec(&mut self, cmd: u32) -> uefi::Result<u32> {
+        exec_immediate(self.pci, cmd)
+    }
+}
+
+fn exec_immediate(pci: &PciIO, cmd: u32) -> uefi::Result<u32> {
     IRS.wait(pci, 10000, PCI_IRS_ICB_BIT, 0)?;
     IRS.or(pci, PCI_IRS_IRV_BIT)?;
     IC.write(pci, cmd)?;
@@ -834,21 +1110,34 @@ fn make_command(codec: Codec, node: Node, verb: Verb, param: Param) -> u32 {
     (codec.0 << 28) | (node.0 << 20) | (verb.0 << 8) | (param.0)
 }
 
+#[cfg(immediate_command_mode)]
+fn make_bus_io<'a>(pci: &'a PciIO) -> uefi::Result<Immediate<'a>> {
+    Immediate::new(pci)
+}
+
+#[cfg(not(immediate_command_mode))]
+fn make_bus_io<'a>(pci: &'a PciIO) -> uefi::Result<CommandResponseBuffers<'a>> {
+    CommandResponseBuffers::new(pci)
+}
+
 fn bus_probe_codecs(pci: &PciIO, codec_mask: u16) -> uefi::Result<alloc::vec::Vec<u32>> {
     let mut codecs = alloc::vec::Vec::new();
     // TBD: use STATESTS/codec_mask instead
     for codec in &[0, 1, 2, 3] {
+        // Create new command response buffer for each new
+        // codec because old one can be broken due to an
+        // access to non-existant codec
+        let mut bus = make_bus_io(pci).ignore_warning()?;
+
         let cmd = make_command(Codec(*codec), HDA_NODE_ROOT, HDA_VERB_PARAMS, HDA_PARAM_VID);
-        match bus_exec(pci, cmd).ignore_warning() {
+        match bus.exec(cmd).ignore_warning() {
             Ok(vid) => {
                 info!("codec {:#x} is detected, response:{:#x}", codec, vid);
-                codec_trace_config(pci, Codec(*codec))?;
+                codec_trace_config(&mut bus, pci, Codec(*codec))?;
                 codecs.push(*codec);
             }
             Err(error) => {
                 info!("codec {:#x} is not detected: {:?}", codec, error.status());
-                // TBD: codec_mask might change there
-                bus_reset(pci)?;
             }
         }
     }
@@ -890,63 +1179,63 @@ fn stream_trace(device: &mut DeviceContext, pci: &PciIO) -> uefi::Result {
     uefi::Status::SUCCESS.into()
 }
 
-fn codec_set_stream(device: &mut DeviceContext, pci: &PciIO, codec: Codec, node: Node) -> uefi::Result {
-    let stream_id = bus_exec(pci, make_command(codec, node, HDA_VERB_GET_CHANNEL_STREAM, Param(0x0)))
+fn codec_set_stream<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &PciIO, codec: Codec, node: Node) -> uefi::Result {
+    let stream_id = bus.exec(make_command(codec, node, HDA_VERB_GET_CHANNEL_STREAM, Param(0x0)))
         .ignore_warning()?;
     info!("codec_set_stream: {:?} read: {:#x}", node, stream_id);
-    bus_exec(pci, make_command(codec, node, HDA_VERB_SET_CHANNEL_STREAM, Param(PCI_SDCTL8_STREAM_1_MASK as u32)))?;
-    let readback = bus_exec(pci, make_command(codec, node, HDA_VERB_GET_CHANNEL_STREAM, Param(0x0)))
+    bus.exec(make_command(codec, node, HDA_VERB_SET_CHANNEL_STREAM, Param(PCI_SDCTL8_STREAM_1_MASK as u32)))?;
+    let readback = bus.exec(make_command(codec, node, HDA_VERB_GET_CHANNEL_STREAM, Param(0x0)))
         .ignore_warning()?;
     info!("codec_set_stream: -- readback: {:#x}", readback);
     uefi::Status::SUCCESS.into()
 }
 
-fn pin_enable_eapd(device: &mut DeviceContext, pci: &PciIO, codec: Codec, node: Node, enable: bool) -> uefi::Result {
-    let caps = bus_exec(pci, make_command(codec, node, HDA_VERB_PARAMS, HDA_PARAM_PIN_WIDGET_CAPABILITIES))
+fn pin_enable_eapd<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &PciIO, codec: Codec, node: Node, enable: bool) -> uefi::Result {
+    let caps = bus.exec(make_command(codec, node, HDA_VERB_PARAMS, HDA_PARAM_PIN_WIDGET_CAPABILITIES))
         .ignore_warning()?;
     if (caps & HDA_PIN_CAPABILITY_EAPDBTL_BIT) != 0 {
-        let eapd = bus_exec(pci, make_command(codec, node, HDA_VERB_GET_EAPDBTL_ENABLE, Param(0x0)))
+        let eapd = bus.exec(make_command(codec, node, HDA_VERB_GET_EAPDBTL_ENABLE, Param(0x0)))
             .ignore_warning()?;
         if enable {
             info!("pin_enable_eapd: {:?} enable EAPD/BTL (current {:#x})", node, eapd);
-            bus_exec(pci, make_command(codec, node, HDA_VERB_SET_EAPDBTL_ENABLE, Param(eapd | (HDA_PIN_EAPDBTL_EAPD_ENABLE_BIT | HDA_PIN_EAPDBTL_BTL_ENABLE_BIT))))?;
+            bus.exec(make_command(codec, node, HDA_VERB_SET_EAPDBTL_ENABLE, Param(eapd | (HDA_PIN_EAPDBTL_EAPD_ENABLE_BIT | HDA_PIN_EAPDBTL_BTL_ENABLE_BIT))))?;
         } else {
             info!("pin_enable_eapd: {:?} disable EAPD/BTL (current {:#x})", node, eapd);
-            bus_exec(pci, make_command(codec, node, HDA_VERB_SET_EAPDBTL_ENABLE, Param(eapd & !(HDA_PIN_EAPDBTL_EAPD_ENABLE_BIT | HDA_PIN_EAPDBTL_BTL_ENABLE_BIT))))?;
+            bus.exec(make_command(codec, node, HDA_VERB_SET_EAPDBTL_ENABLE, Param(eapd & !(HDA_PIN_EAPDBTL_EAPD_ENABLE_BIT | HDA_PIN_EAPDBTL_BTL_ENABLE_BIT))))?;
         }
     }
     uefi::Status::SUCCESS.into()
 }
 
-fn pin_enable_output(device: &mut DeviceContext, pci: &PciIO, codec: Codec, node: Node, enable: bool) -> uefi::Result {
-    let ctl = bus_exec(pci, make_command(codec, node, HDA_VERB_GET_PIN_WIDGET_CONTROL, Param(0x0)))
+fn pin_enable_output<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &PciIO, codec: Codec, node: Node, enable: bool) -> uefi::Result {
+    let ctl = bus.exec(make_command(codec, node, HDA_VERB_GET_PIN_WIDGET_CONTROL, Param(0x0)))
         .ignore_warning()?;
     info!("pin_enable_output: {:?} enable: {}, ctl: {:#x}", node, enable, ctl);
     if enable {
-        bus_exec(pci, make_command(codec, node, HDA_VERB_SET_PIN_WIDGET_CONTROL, Param(ctl | HDA_PIN_WIDGET_CONTROL_OUT_ENABLE_BIT)))?;
+        bus.exec(make_command(codec, node, HDA_VERB_SET_PIN_WIDGET_CONTROL, Param(ctl | HDA_PIN_WIDGET_CONTROL_OUT_ENABLE_BIT)))?;
     } else {
-        bus_exec(pci, make_command(codec, node, HDA_VERB_SET_PIN_WIDGET_CONTROL, Param(ctl & !HDA_PIN_WIDGET_CONTROL_OUT_ENABLE_BIT)))?;
+        bus.exec(make_command(codec, node, HDA_VERB_SET_PIN_WIDGET_CONTROL, Param(ctl & !HDA_PIN_WIDGET_CONTROL_OUT_ENABLE_BIT)))?;
     }
     // TBD: wait 100ms?
     boot_services().stall(milliseconds_to_stall(5));
-    let readback = bus_exec(pci, make_command(codec, node, HDA_VERB_GET_PIN_WIDGET_CONTROL, Param(0x0)))
+    let readback = bus.exec(make_command(codec, node, HDA_VERB_GET_PIN_WIDGET_CONTROL, Param(0x0)))
         .ignore_warning()?;
     info!("pin_enable_output: -- readback: {:#x}", readback);
     uefi::Status::SUCCESS.into()
 }
 
-fn pin_power(device: &mut DeviceContext, pci: &PciIO, codec: Codec, node: Node, up: bool) -> uefi::Result {
-    let power_state = bus_exec(pci, make_command(codec, node, HDA_VERB_GET_POWER_STATE, Param(0x0)))
+fn pin_power<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &PciIO, codec: Codec, node: Node, up: bool) -> uefi::Result {
+    let power_state = bus.exec(make_command(codec, node, HDA_VERB_GET_POWER_STATE, Param(0x0)))
         .ignore_warning()?;
     info!("pin_power: {:?} up: {}, current: {:#x}", node, up, power_state);
     if up {
-        bus_exec(pci, make_command(codec, node, HDA_VERB_SET_POWER_STATE, Param(HDA_POWER_STATE_D0)))?;
+        bus.exec(make_command(codec, node, HDA_VERB_SET_POWER_STATE, Param(HDA_POWER_STATE_D0)))?;
     } else {
-        bus_exec(pci, make_command(codec, node, HDA_VERB_SET_POWER_STATE, Param(HDA_POWER_STATE_D3HOT)))?;
+        bus.exec(make_command(codec, node, HDA_VERB_SET_POWER_STATE, Param(HDA_POWER_STATE_D3HOT)))?;
     }
     // TBD: do we need it at all?
     boot_services().stall(milliseconds_to_stall(5));
-    let power_state = bus_exec(pci, make_command(codec, node, HDA_VERB_GET_POWER_STATE, Param(0x0)))
+    let power_state = bus.exec(make_command(codec, node, HDA_VERB_GET_POWER_STATE, Param(0x0)))
         .ignore_warning()?;
     info!("pin_power: -- readback: {:#x}", power_state);
     if (power_state & BIT8) != 0 {
@@ -955,10 +1244,10 @@ fn pin_power(device: &mut DeviceContext, pci: &PciIO, codec: Codec, node: Node, 
     uefi::Status::SUCCESS.into()
 }
 
-fn codec_set_format(device: &mut DeviceContext, pci: &PciIO, codec: Codec, node: Node, format: u16) -> uefi::Result {
+fn codec_set_format<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &PciIO, codec: Codec, node: Node, format: u16) -> uefi::Result {
     info!("codec_set_format: {:?} format: {:#x}", node, format);
-    bus_exec(pci, make_command(codec, node, HDA_VERB_SET_STREAM_FORMAT, Param(format as u32)))?;
-    let readback = bus_exec(pci, make_command(codec, node, HDA_VERB_GET_STREAM_FORMAT, Param(0x0)))
+    bus.exec(make_command(codec, node, HDA_VERB_SET_STREAM_FORMAT, Param(format as u32)))?;
+    let readback = bus.exec(make_command(codec, node, HDA_VERB_GET_STREAM_FORMAT, Param(0x0)))
         .ignore_warning()?;
     info!("codec_set_format -- readback: {:#x}", readback);
     uefi::Status::SUCCESS.into()
@@ -980,14 +1269,14 @@ fn parse_node_count(response: u32) -> uefi::Result<NodeDescriptor> {
     return Ok(NodeDescriptor { start_id, count }.into()).into();
 }
 
-fn find_audio_function_node(pci: &PciIO, codec: Codec) -> uefi::Result<Node> {
-    let response = bus_exec(pci, make_command(codec, HDA_NODE_ROOT, HDA_VERB_PARAMS, HDA_PARAM_NODE_COUNT))
+fn find_audio_function_node<B: BusIo>(bus: &mut B, pci: &PciIO, codec: Codec) -> uefi::Result<Node> {
+    let response = bus.exec(make_command(codec, HDA_NODE_ROOT, HDA_VERB_PARAMS, HDA_PARAM_NODE_COUNT))
         .ignore_warning()?;
     let NodeDescriptor {start_id, count} = parse_node_count(response).ignore_warning()?;
     info!("sub nodes: {} nodes starting from {}", start_id, count);
     let mut afg = None;
     for n in start_id..(start_id + count) {
-        let fun = bus_exec(pci, make_command(codec, Node(n), HDA_VERB_PARAMS, HDA_PARAM_FUNCTION_TYPE))
+        let fun = bus.exec(make_command(codec, Node(n), HDA_VERB_PARAMS, HDA_PARAM_FUNCTION_TYPE))
             .ignore_warning()?;
         if fun & HDA_FUNCTION_TYPE_MASK == HDA_FUNCTION_AUDIO {
             if afg.is_some() {
@@ -1003,8 +1292,8 @@ fn find_audio_function_node(pci: &PciIO, codec: Codec) -> uefi::Result<Node> {
     Ok(afg.unwrap().into())
 }
 
-fn pin_mute_unmute(device: &mut DeviceContext, pci: &PciIO, codec: Codec, node: Node, mute: bool) -> uefi::Result {
-    let amc = bus_exec(pci, make_command(codec, node, HDA_VERB_PARAMS, HDA_PARAM_AMPLIFIER_OUTPUT_CAPABILITY))
+fn pin_mute_unmute<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &PciIO, codec: Codec, node: Node, mute: bool) -> uefi::Result {
+    let amc = bus.exec(make_command(codec, node, HDA_VERB_PARAMS, HDA_PARAM_AMPLIFIER_OUTPUT_CAPABILITY))
         .ignore_warning()?;
     let num_steps = (amc & HDA_AMPLIFIER_CAPABILITY_NUMSTEPS_MASK) >> 8;
     let offset = amc & HDA_AMPLIFIER_CAPABILITY_OFFSET_MASK;
@@ -1019,62 +1308,62 @@ fn pin_mute_unmute(device: &mut DeviceContext, pci: &PciIO, codec: Codec, node: 
         } else {
             info!("unmute {:?}", node);
         }
-        bus_exec(pci, make_command(codec, node, HDA_VERB_SET_AMPLIFIER_GAIN_MUTE, Param(flags)))?;
+        bus.exec(make_command(codec, node, HDA_VERB_SET_AMPLIFIER_GAIN_MUTE, Param(flags)))?;
     }
     Ok(().into())
 }
 
-fn pin_select(device: &mut DeviceContext, pci: &PciIO, codec: Codec, node: Node, index: usize) -> uefi::Result {
-    let len = bus_exec(pci, make_command(codec, node, HDA_VERB_PARAMS, HDA_PARAM_CONNECTION_LIST_LENGTH))
+fn pin_select<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &PciIO, codec: Codec, node: Node, index: usize) -> uefi::Result {
+    let len = bus.exec(make_command(codec, node, HDA_VERB_PARAMS, HDA_PARAM_CONNECTION_LIST_LENGTH))
         .ignore_warning()?;
-    let select = bus_exec(pci, make_command(codec, node, HDA_VERB_GET_CONNECTION_SELECT, Param(0x0)))
+    let select = bus.exec(make_command(codec, node, HDA_VERB_GET_CONNECTION_SELECT, Param(0x0)))
         .ignore_warning()?;
     info!("pin_select: {:?} is changing connection select from {} to {}", node, select, index);
     if index < len as usize {
-        bus_exec(pci, make_command(codec, node, HDA_VERB_SET_CONNECTION_SELECT, Param(index as u32)))?;
-        let select = bus_exec(pci, make_command(codec, node, HDA_VERB_GET_CONNECTION_SELECT, Param(0x0)))
+        bus.exec(make_command(codec, node, HDA_VERB_SET_CONNECTION_SELECT, Param(index as u32)))?;
+        let select = bus.exec(make_command(codec, node, HDA_VERB_GET_CONNECTION_SELECT, Param(0x0)))
             .ignore_warning()?;
         info!("pin_select: -- readback: {}", select);
     }
     Ok(().into())
 }
 
-fn codec_trace_config(pci: &PciIO, codec: Codec) -> uefi::Result {
+fn codec_trace_config<B: BusIo>(bus: &mut B, pci: &PciIO, codec: Codec) -> uefi::Result {
     info!("codec_trace_config");
-    let afg = find_audio_function_node(pci, codec).ignore_warning()?;
+    let afg = find_audio_function_node(bus, pci, codec).ignore_warning()?;
     info!("Audio FG is {:?}", afg);
-    let ps_supported = bus_exec(pci, make_command(codec, afg, HDA_VERB_PARAMS, HDA_PARAM_SUPPORTED_POWER_STATES))
+    let ps_supported = bus.exec(make_command(codec, afg, HDA_VERB_PARAMS, HDA_PARAM_SUPPORTED_POWER_STATES))
         .ignore_warning()?;
-    let ps_current = bus_exec(pci, make_command(codec, afg, HDA_VERB_GET_POWER_STATE, Param(0x0)))
+    let ps_current = bus.exec(make_command(codec, afg, HDA_VERB_GET_POWER_STATE, Param(0x0)))
         .ignore_warning()?;
-    let response = bus_exec(pci, make_command(codec, afg, HDA_VERB_PARAMS, HDA_PARAM_NODE_COUNT))
+    let response = bus.exec(make_command(codec, afg, HDA_VERB_PARAMS, HDA_PARAM_NODE_COUNT))
         .ignore_warning()?;
     let NodeDescriptor {start_id, count} = parse_node_count(response)
         .ignore_warning()?;
     info!("AFG {:?} has {} sub nodes starting with {}", afg, count, start_id);
     info!("AFG power state is {:#x} (supported {:#x})", ps_current, ps_supported);
     for n in start_id..(start_id + count) {
-        let audio_caps = bus_exec(pci, make_command(codec, Node(n), HDA_VERB_PARAMS, HDA_PARAM_AUDIO_WIDGET_CAPABILITIES))
+        let audio_caps = bus.exec(make_command(codec, Node(n), HDA_VERB_PARAMS, HDA_PARAM_AUDIO_WIDGET_CAPABILITIES))
             .ignore_warning()?;
-        let pin_caps = bus_exec(pci, make_command(codec, Node(n), HDA_VERB_PARAMS, HDA_PARAM_PIN_WIDGET_CAPABILITIES))
+        let pin_caps = bus.exec(make_command(codec, Node(n), HDA_VERB_PARAMS, HDA_PARAM_PIN_WIDGET_CAPABILITIES))
             .ignore_warning()?;
         let typ = widget_capabilities_type(audio_caps);
-        let cfg = bus_exec(pci, make_command(codec, Node(n), HDA_VERB_GET_CONFIG_DEFAULT, Param(0x0)))
+        let cfg = bus.exec(make_command(codec, Node(n), HDA_VERB_GET_CONFIG_DEFAULT, Param(0x0)))
             .ignore_warning()
             .map(PinConfig::from)?;
-        let ctl = bus_exec(pci, make_command(codec, Node(n), HDA_VERB_GET_PIN_WIDGET_CONTROL, Param(0x0)))
+        let ctl = bus.exec(make_command(codec, Node(n), HDA_VERB_GET_PIN_WIDGET_CONTROL, Param(0x0)))
             .ignore_warning()?;
-        let ps_current = bus_exec(pci, make_command(codec, Node(n), HDA_VERB_GET_POWER_STATE, Param(0x0)))
+        let ps_current = bus.exec(make_command(codec, Node(n), HDA_VERB_GET_POWER_STATE, Param(0x0)))
             .ignore_warning()?;
-        let ps_supported = bus_exec(pci, make_command(codec, Node(n), HDA_VERB_PARAMS, HDA_PARAM_SUPPORTED_POWER_STATES))
+        let ps_supported = bus.exec(make_command(codec, Node(n), HDA_VERB_PARAMS, HDA_PARAM_SUPPORTED_POWER_STATES))
             .ignore_warning()?;
-        let amc = bus_exec(pci, make_command(codec, Node(n), HDA_VERB_PARAMS, HDA_PARAM_AMPLIFIER_OUTPUT_CAPABILITY))
+        let amc = bus.exec(make_command(codec, Node(n), HDA_VERB_PARAMS, HDA_PARAM_AMPLIFIER_OUTPUT_CAPABILITY))
             .ignore_warning()?;
-        let len = bus_exec(pci, make_command(codec, Node(n), HDA_VERB_PARAMS, HDA_PARAM_CONNECTION_LIST_LENGTH))
+        let len = bus.exec(make_command(codec, Node(n), HDA_VERB_PARAMS, HDA_PARAM_CONNECTION_LIST_LENGTH))
             .ignore_warning()?;
-        let select = bus_exec(pci, make_command(codec, Node(n), HDA_VERB_GET_CONNECTION_SELECT, Param(0x0)))
+        let select = bus.exec(make_command(codec, Node(n), HDA_VERB_GET_CONNECTION_SELECT, Param(0x0)))
             .ignore_warning()?;
-        let vol_knob = bus_exec(pci, make_command(codec, Node(n), HDA_VERB_PARAMS, HDA_PARAM_VOLUME_KNOB_CAPABILITIES))
+        let vol_knob = bus.exec(make_command(codec, Node(n), HDA_VERB_PARAMS, HDA_PARAM_VOLUME_KNOB_CAPABILITIES))
             .ignore_warning()?;
         info!("{:?} has ctrl {:#x}", n, ctl);
         info!("{:?} has type {:#x}", n, typ);
@@ -1090,7 +1379,7 @@ fn codec_trace_config(pci: &PciIO, codec: Codec) -> uefi::Result {
                 step += 2;
             }
             for i in (0..(len & HDA_CONNECTION_LIST_LENGTH_MASK)).step_by(step) {
-                let mut cls = bus_exec(pci, make_command(codec, Node(n), HDA_VERB_GET_CONNECTION_LIST, Param(i)))
+                let mut cls = bus.exec(make_command(codec, Node(n), HDA_VERB_GET_CONNECTION_LIST, Param(i)))
                     .ignore_warning()?;
                 for _ in 0..step {
                     info!("  {}: {}", i, cls & 0xff);
@@ -1124,7 +1413,7 @@ fn codec_trace_config(pci: &PciIO, codec: Codec) -> uefi::Result {
         }
         if amc & HDA_AMPLIFIER_CAPABILITY_NUMSTEPS_MASK != 0 {
             // Get the output gain/mute params
-            let amp = bus_exec(pci, make_command(codec, Node(n), HDA_VERB_GET_AMPLIFIER_GAIN_MUTE, Param(BIT15)))
+            let amp = bus.exec(make_command(codec, Node(n), HDA_VERB_GET_AMPLIFIER_GAIN_MUTE, Param(BIT15)))
                 .ignore_warning()?;
             info!("Amplifier Info");
             let mute = (amp >> 7) & 0x1;
@@ -1180,34 +1469,34 @@ fn codec_trace_config(pci: &PciIO, codec: Codec) -> uefi::Result {
     uefi::Status::SUCCESS.into()
 }
 
-fn codec_setup_stream(device: &mut DeviceContext, pci: &PciIO, codec: Codec, format: u16) -> uefi::Result {
-    let afg = find_audio_function_node(pci, codec)
+fn codec_setup_stream<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &PciIO, codec: Codec, format: u16) -> uefi::Result {
+    let afg = find_audio_function_node(bus, pci, codec)
         .ignore_warning()?;
-    let response = bus_exec(pci, make_command(codec, afg, HDA_VERB_PARAMS, HDA_PARAM_NODE_COUNT))
+    let response = bus.exec(make_command(codec, afg, HDA_VERB_PARAMS, HDA_PARAM_NODE_COUNT))
         .ignore_warning()?;
     let NodeDescriptor { start_id, count } = parse_node_count(response)
         .ignore_warning()?;
     info!("sub nodes: {} nodes starting from {}", start_id, count);
-    pin_power(device, pci, codec, afg, true)?;
+    pin_power(bus, device, pci, codec, afg, true)?;
     for n in start_id..(start_id + count) {
-        pin_power(device, pci, codec, Node(n), true)?;
-        let cap = bus_exec(pci, make_command(codec, Node(n), HDA_VERB_PARAMS, HDA_PARAM_AUDIO_WIDGET_CAPABILITIES))
+        pin_power(bus, device, pci, codec, Node(n), true)?;
+        let cap = bus.exec(make_command(codec, Node(n), HDA_VERB_PARAMS, HDA_PARAM_AUDIO_WIDGET_CAPABILITIES))
             .ignore_warning()?;
         let widget_type = widget_capabilities_type(cap);
         if widget_type == HDA_WIDGET_AUDIO_OUT {
             info!("Configure {:?} as Audio Out", Node(n));
-            codec_set_stream(device, pci, codec, Node(n))?;
-            codec_set_format(device, pci, codec, Node(n), format)?;
-            pin_mute_unmute(device, pci, codec, Node(n), false)?;
+            codec_set_stream(bus, device, pci, codec, Node(n))?;
+            codec_set_format(bus, device, pci, codec, Node(n), format)?;
+            pin_mute_unmute(bus, device, pci, codec, Node(n), false)?;
         } else if widget_type == HDA_WIDGET_PIN_COMPLEX {
             info!("Configure {:?} as Pin Complex", Node(n));
-            pin_enable_eapd(device, pci, codec, Node(n), true)?;
-            pin_enable_output(device, pci, codec, Node(n), true)?;
-            pin_mute_unmute(device, pci, codec, Node(n), false)?;
+            pin_enable_eapd(bus, device, pci, codec, Node(n), true)?;
+            pin_enable_output(bus, device, pci, codec, Node(n), true)?;
+            pin_mute_unmute(bus, device, pci, codec, Node(n), false)?;
         } else if widget_type == HDA_WIDGET_AUDIO_MIX {
             info!("Configure {:?} as Audio Mix", Node(n));
-            pin_enable_output(device, pci, codec, Node(n), true)?;
-            pin_mute_unmute(device, pci, codec, Node(n), false)?;
+            pin_enable_output(bus, device, pci, codec, Node(n), true)?;
+            pin_mute_unmute(bus, device, pci, codec, Node(n), false)?;
         }
     }
     uefi::Status::SUCCESS.into()
@@ -1560,8 +1849,10 @@ fn stream_play_loop(device: &mut DeviceContext, pci: &PciIO, duration: u64, samp
 
     let mut control = Loop::new(&mut *bdl, samples);
 
+    let mut bus = make_bus_io(pci).ignore_warning()?;
+
     // TBD: reset the stream? we could only modify CBL after _some_ reset
-    codec_setup_stream(device, pci, device.codec, format)?;
+    codec_setup_stream(&mut bus, device, pci, device.codec, format)?;
     stream_setup(device, pci, &bdl_dma, loop_buffers as u32, loop_samples as u32, format)?;
 
     stream_loop(device, pci, &mut control, samples.len() as u64, channel_count as u64, sampling_rate as u64, duration as u64)
@@ -1918,8 +2209,10 @@ extern "efiapi" fn hda_start(this: &DriverBinding, controller_handle: Handle, re
 
         let detected_codecs = bus_probe_codecs(pci, codec_mask).ignore_warning()?;
 
+        let mut bus = make_bus_io(pci).ignore_warning()?;
+
         for codec in detected_codecs.into_iter() {
-            bus_create_child(this.driver_handle(), controller_handle, pci, Codec(codec));
+            bus_create_child(this.driver_handle(), controller_handle, &mut bus, pci, Codec(codec));
         }
     }
 
@@ -1929,7 +2222,7 @@ extern "efiapi" fn hda_start(this: &DriverBinding, controller_handle: Handle, re
     uefi::Status::SUCCESS
 }
 
-fn bus_create_child(driver_handle: Handle, controller_handle: Handle, pci: &PciIO, codec: Codec) -> uefi::Result {
+fn bus_create_child<B: BusIo>(driver_handle: Handle, controller_handle: Handle, bus: &mut B, pci: &PciIO, codec: Codec) -> uefi::Result {
     let mut device = init_context(driver_handle, controller_handle, pci, codec)
         .ignore_warning()?;
     let audio_out = &*device.audio_interface;
