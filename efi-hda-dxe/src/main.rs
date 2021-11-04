@@ -1428,7 +1428,7 @@ where C: DmaControl {
                 queue_room = room - copied;
                 start_lpib = actual_lpib;
             }
-            stream_trace(device, pci)?;
+            // stream_trace(device, pci)?;
             // bus_trace_registers(pci)?;
             // Playback event must be placed first so that it
             // would be checked first
@@ -1516,7 +1516,7 @@ impl<'a> DmaControl for Loop<'a> {
         let mut count = count;
         let mut total = 0;
         while count > 0 {
-            info!(" transfer iteration: count = {}, bdl = {}, samples = {}", count, self.bdl_position, self.samples_position);
+            // info!(" transfer iteration: count = {}, bdl = {}, samples = {}", count, self.bdl_position, self.samples_position);
             let CopyResult {loop_buffers, loop_samples} =
                 fill_bde(
                     &mut self.bdl.buffers[self.bdl_position],
@@ -1524,7 +1524,7 @@ impl<'a> DmaControl for Loop<'a> {
                     self.samples_position,
                     self.samples
                 );
-            info!("  transfer result: loop_samples = {}, loop_buffers = {}", loop_samples, loop_buffers);
+            // info!("  transfer result: loop_samples = {}, loop_buffers = {}", loop_samples, loop_buffers);
             self.samples_position = (self.samples_position + loop_samples) % self.samples.len();
             self.bdl_position = (self.bdl_position + loop_buffers) % BUFFER_COUNT;
             count -= loop_samples;
