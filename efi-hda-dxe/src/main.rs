@@ -192,7 +192,8 @@ const fn bitspan(h: usize, l: usize) -> u64 {
 
 const PCI_CORBCTL_CMEI_BIT: u8 = BIT0 as u8;
 const PCI_CORBCTL_DMA_BIT: u8 = BIT1 as u8;
-const PCI_CORBRP_RST_BIT: u32 = BIT15;
+const PCI_CORBRP_RST_BIT: u16 = BIT15 as u16;
+const PCI_CORBBASE_MASK: u32 = bitspan(31, 7) as u32;
 const PCI_GCTL_RST_BIT: u32 = BIT0;
 const PCI_GCTL_UNSOLICITED_BIT: u32 = BIT8;
 const PCI_SDCTL8_STREAM_MASK: u8 = (BIT7 | BIT6 | BIT5 | BIT4) as u8;
@@ -213,10 +214,11 @@ const PCI_RIRBCTL_DMA_BIT: u8 = BIT1 as u8;
 const PCI_RIRBCTL_INT_MASK: u8 = (BIT0 | BIT1 | BIT2) as u8;
 const PCI_RIRBCTL_IRQ_BIT: u8 = BIT0 as u8;
 const PCI_RIRBCTL_OVERRUN_BIT: u8 = BIT2 as u8;
-const PCI_RIRBSTS_INT_MASK: u8 = (BIT0 | BIT2)as u8;
+const PCI_RIRBSTS_INT_MASK: u8 = (BIT0 | BIT2) as u8;
 const PCI_RIRBSTS_OVERRUN_BIT: u8 = BIT2 as u8;
 const PCI_RIRBSTS_RESPONSE_BIT: u8 = BIT0 as u8;
 const PCI_RIRBWP_RST_BIT: u16 = BIT15 as u16;
+const PCI_RINTCNT_RSVDP_MASK: u16 = bitspan(15, 8) as u16;
 const PCI_STATESTS_INT_MASK: u16 = (BIT0 | BIT1 | BIT2) as u16;
 const PCI_STATESTS_SDI0_BIT: u16 = BIT0 as u16;
 const PCI_STATESTS_SDI1_BIT: u16 = BIT1 as u16;
