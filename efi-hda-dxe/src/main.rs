@@ -798,11 +798,16 @@ impl<'a> CommandResponseBuffers<'a> {
     }
 
     fn init_io(&mut self) -> uefi::Result {
+        // TBD: "Pin also implements DerefMut to the
+        // data, which can be used to access the inner
+        // value. However, DerefMut only provides a
+        // reference that lives for as long as the borrow of
+        // the Pin, not the lifetime of the Pin itself. This
+        // method allows turning the Pin into a reference
+        // with the same lifetime as the original Pin."
+        //   -- https://doc.rust-lang.org/std/pin/struct.Pin.html#method.get_mut
         let corb = self.pci
-            .map(
-                uefi::proto::pci::IoOperation::BusMasterWrite,
-                &mut *self.command_ring as *mut CommandRing as *mut _,
-                mem::size_of::<CommandRing>())
+            .map_ex(uefi::proto::pci::IoOperation::BusMasterWrite, &mut *self.command_ring)
             .map_err(|error| {
                 error!("corb: pci map returned {:?}", error.status());
                 error
@@ -811,10 +816,7 @@ impl<'a> CommandResponseBuffers<'a> {
         // Drop will unmap the memory buffer for us
         let corb = PciMappingGuard::wrap(self.pci, corb);
         let rirb = self.pci
-            .map(
-                uefi::proto::pci::IoOperation::BusMasterWrite,
-                &mut *self.response_ring as *mut ResponseRing as *mut _,
-                mem::size_of::<ResponseRing>())
+            .map_ex(uefi::proto::pci::IoOperation::BusMasterWrite, &mut *self.response_ring)
             .map_err(|error| {
                 error!("rirb: pci map returned {:?}", error.status());
                 error
@@ -1828,11 +1830,11 @@ fn stream_play_loop(device: &mut DeviceContext, pci: &PciIO, duration: u64, samp
     let mut bdl = unsafe { bdl.assume_init() };
 
     let bdl_dma = pci
-        .map(
-            uefi::proto::pci::IoOperation::BusMasterWrite,
-            &mut *bdl as *mut BufferDescriptorListWithBuffers as *mut _,
-            mem::size_of::<BufferDescriptorListWithBuffers>())
-        .map_err(|error| {error!("map operation failed: {:?}", error.status()); error})
+        .map_ex(uefi::proto::pci::IoOperation::BusMasterWrite, &mut *bdl)
+        .map_err(|error| {
+            error!("map operation failed: {:?}", error.status());
+            error
+        })
         .ignore_warning()?;
     // Drop will unmap the memory buffer for us
     let mut bdl_dma = PciMappingGuard::wrap(pci, bdl_dma);
