@@ -4,7 +4,6 @@
 // necessary for derive(Protocol) in our crate
 #![feature(negative_impls)]
 
-#[macro_use]
 extern crate log;
 extern crate uefi;
 
