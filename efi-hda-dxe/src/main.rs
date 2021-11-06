@@ -476,10 +476,6 @@ impl EventGuard {
     fn wrap(event: uefi::Event) -> EventGuard {
         EventGuard (event)
     }
-
-    fn unwrap(&self) -> uefi::Event {
-        self.0
-    }
 }
 
 impl Drop for EventGuard {
@@ -487,6 +483,19 @@ impl Drop for EventGuard {
         boot_services()
             .close_event(self.0)
             .expect_success("no good");
+    }
+}
+
+impl Deref for EventGuard {
+    type Target = uefi::Event;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for EventGuard {
+    fn deref_mut(&mut self) -> &mut uefi::Event {
+        &mut self.0
     }
 }
 
@@ -1677,7 +1686,7 @@ where C: DmaControl {
     let playback_time = milliseconds_to_timer_period(duration);
     boot_services()
         .set_timer(
-            playback_event.unwrap(),
+            *playback_event,
             uefi::table::boot::TimerTrigger::Relative(playback_time))?;
     // TBD: this is basically called period length in alsa,
     //      maybe add as configuration parameter via
@@ -1685,7 +1694,7 @@ where C: DmaControl {
     let delay = milliseconds_to_timer_period(sample_count / channel_count / sampling_rate);
     boot_services()
         .set_timer(
-            trace_event.unwrap(),
+            *trace_event,
             uefi::table::boot::TimerTrigger::Periodic(delay))?;
     stream_sync_get(device, pci);
     stream_start(device, pci);
@@ -1724,7 +1733,7 @@ where C: DmaControl {
             // Playback event must be placed first so that it
             // would be checked first
             let index = boot_services()
-                .wait_for_event (&mut [playback_event.unwrap(), trace_event.unwrap()])
+                .wait_for_event (&mut [*playback_event, *trace_event])
                 .discard_errdata()?;
             if index.unwrap() == 0 {
                 break;
