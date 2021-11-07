@@ -1278,19 +1278,16 @@ struct NodeDescriptor {
 }
 
 fn parse_node_count(response: u32) -> uefi::Result<NodeDescriptor> {
-    if response & 0xffff_ffff == 0xffff_ffff {
-        error!("error reading node count");
-        return Err(uefi::Status::DEVICE_ERROR.into());
-    }
     let start_id = (response >> 16) & 0x7fff;
     let count = response & 0x7fff;
-    return Ok(NodeDescriptor { start_id, count }.into()).into();
+    Ok(NodeDescriptor { start_id, count }.into())
 }
 
 fn find_audio_function_node<B: BusIo>(bus: &mut B, pci: &PciIO, codec: Codec) -> uefi::Result<Node> {
-    let response = bus.exec(make_command(codec, HDA_NODE_ROOT, HDA_VERB_PARAMS, HDA_PARAM_NODE_COUNT))
+    let NodeDescriptor {start_id, count} = bus.exec(make_command(codec, HDA_NODE_ROOT, HDA_VERB_PARAMS, HDA_PARAM_NODE_COUNT))
+        .ignore_warning()
+        .and_then(parse_node_count)
         .ignore_warning()?;
-    let NodeDescriptor {start_id, count} = parse_node_count(response).ignore_warning()?;
     info!("sub nodes: {} nodes starting from {}", start_id, count);
     let mut afg = None;
     for n in start_id..(start_id + count) {
@@ -1354,9 +1351,9 @@ fn codec_trace_config<B: BusIo>(bus: &mut B, pci: &PciIO, codec: Codec) -> uefi:
         .ignore_warning()?;
     let ps_current = bus.exec(make_command(codec, afg, HDA_VERB_GET_POWER_STATE, Param(0x0)))
         .ignore_warning()?;
-    let response = bus.exec(make_command(codec, afg, HDA_VERB_PARAMS, HDA_PARAM_NODE_COUNT))
-        .ignore_warning()?;
-    let NodeDescriptor {start_id, count} = parse_node_count(response)
+    let NodeDescriptor {start_id, count} = bus.exec(make_command(codec, afg, HDA_VERB_PARAMS, HDA_PARAM_NODE_COUNT))
+        .ignore_warning()
+        .and_then(parse_node_count)
         .ignore_warning()?;
     info!("AFG {:?} has {} sub nodes starting with {}", afg, count, start_id);
     info!("AFG power state is {:#x} (supported {:#x})", ps_current, ps_supported);
