@@ -371,7 +371,7 @@ struct StreamRegisterSet {
 
 impl StreamRegisterSet {
     fn new(index: u32) -> StreamRegisterSet {
-        let base = PCI_SDBASE + PCI_SDSPAN * index as u32;
+        let base = PCI_SDBASE + PCI_SDSPAN * index;
         StreamRegisterSet {
             index,
             base
@@ -422,7 +422,7 @@ impl StreamRegisterSet {
 }
 
 fn out_stream(gcap: &GlobalCapabilities, index: usize) -> StreamRegisterSet {
-    StreamRegisterSet::new(gcap.in_streams as u32 + index as u32)
+    StreamRegisterSet::new(u32::from(gcap.in_streams) + index as u32)
 }
 
 fn in_stream(gcap: &GlobalCapabilities, index: usize) -> StreamRegisterSet {
@@ -430,7 +430,7 @@ fn in_stream(gcap: &GlobalCapabilities, index: usize) -> StreamRegisterSet {
 }
 
 fn out_stream_1(device: &DeviceContext) -> StreamRegisterSet {
-    StreamRegisterSet::new(device.in_streams as u32)
+    StreamRegisterSet::new(u32::from(device.in_streams))
 }
 
 #[repr(C, packed)]
@@ -642,7 +642,7 @@ impl GlobalCapabilities {
             in_streams: (gcap >> 8) & 0b1111,
             bd_streams: (gcap >> 3) & 0b11111,
             sdo_signals: (gcap >> 1) & 0b11,
-            ok_64: (gcap as u32 & BIT0) == BIT0
+            ok_64: (u32::from(gcap) & BIT0) == BIT0
         }
     }
 }
@@ -1190,9 +1190,9 @@ fn stream_trace(device: &mut DeviceContext, pci: &PciIO) -> uefi::Result {
     let fifow = sd.fifow().read(pci).ignore_warning()?;
     let fifos = sd.fifos().read(pci).ignore_warning()?;
     info!("stream_trace: ctl:{:#b}, fmt:{:#x}, cbl:{}, lvi:{}, bdp:{:#x}, sts:{:#b}, lpib:{}, fifow:{:#x}, fifos:{:#x}",
-          ((ctl8 as u32) << 16) | ctl16 as u32,
+          ((u32::from(ctl8)) << 16) | u32::from(ctl16),
           fmt, cbl, lvi,
-          ((bdpu as u64) << 32) | bdpl as u64,
+          ((u64::from(bdpu)) << 32) | u64::from(bdpl),
           sts, lpib, fifow, fifos);
     uefi::Status::SUCCESS.into()
 }
@@ -1264,7 +1264,7 @@ fn pin_power<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &PciIO, cod
 
 fn codec_set_format<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &PciIO, codec: Codec, node: Node, format: u16) -> uefi::Result {
     info!("codec_set_format: {:?} format: {:#x}", node, format);
-    bus.exec(make_command(codec, node, HDA_VERB_SET_STREAM_FORMAT, Param(format as u32)))?;
+    bus.exec(make_command(codec, node, HDA_VERB_SET_STREAM_FORMAT, Param(u32::from(format))))?;
     let readback = bus.exec(make_command(codec, node, HDA_VERB_GET_STREAM_FORMAT, Param(0x0)))
         .ignore_warning()?;
     info!("codec_set_format -- readback: {:#x}", readback);
@@ -2009,7 +2009,7 @@ fn stream_wait_sync_stop(device: &mut DeviceContext, pci: &PciIO) -> uefi::Resul
     uefi::Status::SUCCESS.into()
 }
 
-fn stream_loop<C>(device: &mut DeviceContext, pci: &PciIO, control: &mut C, sample_count: u64, channel_count: u64, sampling_rate: u64, duration: u64) -> uefi::Result
+fn stream_loop<C>(device: &mut DeviceContext, pci: &PciIO, control: &mut C, sample_count: u64, channel_count: u8, sampling_rate: u64, duration: u64) -> uefi::Result
 where C: DmaControl {
     let playback_event = boot_services()
         .create_timer_event()
@@ -2030,7 +2030,7 @@ where C: DmaControl {
     // TBD: this is basically called period length in alsa,
     //      maybe add as configuration parameter via
     //      DriverConfiguration?
-    let delay = milliseconds_to_timer_period(sample_count / channel_count / sampling_rate);
+    let delay = milliseconds_to_timer_period(sample_count / u64::from(channel_count) / sampling_rate);
     boot_services()
         .set_timer(
             *trace_event,
@@ -2205,7 +2205,7 @@ fn stream_play_loop(device: &mut DeviceContext, pci: &PciIO, duration: u64, samp
     codec_setup_stream(&mut bus, device, pci, device.codec, format)?;
     stream_setup(device, pci, &bdl_dma, loop_buffers as u32, loop_samples as u32, format)?;
 
-    stream_loop(device, pci, &mut control, samples.len() as u64, channel_count as u64, sampling_rate as u64, duration as u64)
+    stream_loop(device, pci, &mut control, samples.len() as u64, channel_count, sampling_rate as u64, duration as u64)
         .map_err(|error| {
             stream_cleanup(device, pci).expect_success("double fail is unexpected");
             error
@@ -2290,7 +2290,7 @@ extern "efiapi" fn hda_write(this: &mut SimpleAudioOut, sampling_rate: u32, chan
     }
     // SAFETY: TBD
     let samples = unsafe { core::slice::from_raw_parts(samples, sample_count) };
-    let duration_ms = 1000 * sample_count as u64 / channel_count as u64 / sampling_rate as u64;
+    let duration_ms = 1000 * sample_count as u64 / u64::from(channel_count) / u64::from(sampling_rate);
     // SAFETY: safe because no other references exist in our code
     let pci = unsafe { pci                           // OpenProtocol<'boot>
                        .as_proto()                   // &'boot UnsafeCell<PciIO>
@@ -2358,8 +2358,8 @@ fn init_context(driver_handle: Handle, controller_handle: Handle, pci: &PciIO, c
         controller_handle,
         child_handle: controller_handle,                 // TBD: no handle at the moment of context creation
         driver_handle,
-        in_streams: gcap.in_streams as u32,
-        out_streams: gcap.out_streams as u32,
+        in_streams: u32::from(gcap.in_streams),
+        out_streams: u32::from(gcap.out_streams),
         codec,
         audio_interface: Pin::new(Box::new(SimpleAudioOut {
             reset: hda_reset,
@@ -2443,7 +2443,7 @@ fn square(phase: usize, period: usize) -> i16 {
 }
 
 fn wave(buffer: &mut [i16], channels: u8, sampling_rate: u32, freq: u16) -> usize {
-    if freq == 0 || channels == 0 || sampling_rate < freq as u32 {
+    if freq == 0 || channels == 0 || sampling_rate < u32::from(freq) {
         // TBD: other checks
         return 0;
     }
