@@ -2185,7 +2185,7 @@ fn stream_play_loop(device: &mut DeviceContext, pci: &PciIO, duration: u64, samp
         })
         .ignore_warning()?;
     // Drop will unmap the memory buffer for us
-    let mut bdl_dma = PciMappingGuard::wrap(pci, bdl_dma);
+    let bdl_dma = PciMappingGuard::wrap(pci, bdl_dma);
 
     let (format, closest_rate) = stream_select_rate(device, pci, sampling_rate, channel_count)
         .ignore_warning()?;
