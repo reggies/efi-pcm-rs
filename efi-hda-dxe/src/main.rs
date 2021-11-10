@@ -8,6 +8,9 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
+// TBD: cringe
+#![allow(unused_must_use)]
+
 // Because there are too many constants that we won't gonna use
 #![allow(dead_code)]
 
