@@ -1921,21 +1921,13 @@ fn stream_setup(device: &mut DeviceContext, pci: &PciIO, mapping: &uefi::proto::
         .cbl()
         .write(pci, loop_samples * mem::size_of::<i16>() as u32)?;
     // set the stream format
-    let osd0fmt = out_stream_1(device)
-        .fmt()
-        .read(pci)
-        .ignore_warning()?;
     out_stream_1(device)
         .fmt()
-        .write(pci, (osd0fmt & PCI_SDFMT_RSVDP_MASK) | (format & !PCI_SDFMT_RSVDP_MASK))?;
+        .update(pci, format, !PCI_SDFMT_RSVDP_MASK)?;
     // set the stream LVI of the BDL
-    let osd0lvi = out_stream_1(device)
-        .lvi()
-        .read(pci)
-        .ignore_warning()?;
     out_stream_1(device)
         .lvi()
-        .write(pci, (osd0lvi & PCI_SDLVI_RSVDP_MASK) | (loop_buffers as u16 - 1))?;
+        .update(pci, loop_buffers as u16 - 1, !PCI_SDLVI_RSVDP_MASK)?;
     // set the BDL address
     if ((mapping.device_address() & 0xffffffff) as u32 & !PCI_SDBDPL_MASK) != 0 {
         error!("mapping address is invalid {:#x}", mapping.device_address());
