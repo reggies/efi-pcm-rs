@@ -1,3 +1,8 @@
+[patch.crates-io]
+uefi = { path = "/home/reggies/uefi-rs", features = ['exts', 'logger', 'alloc'] }
+uefi-macros = { path = "/home/reggies/uefi-rs/uefi-macros" }
+uefi-services = { path = "/home/reggies/uefi-rs/uefi-services" }
+
 [patch."ssh://git@github.com/reggies/uefi-rs"]
 uefi = { path = "/home/reggies/uefi-rs", features = ['exts', 'logger', 'alloc'] }
 uefi-macros = { path = "/home/reggies/uefi-rs/uefi-macros" }
