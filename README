@@ -1,0 +1,43 @@
+# How to build
+
+```
+rustup install nightly
+rustup component add build-std
+rustup default nightly
+
+cargo build -Z build-std --target x86_64-unknown-uefi
+```
+
+# Test HDA
+
+1. Get some OVMF and setup qemu
+
+```
+apt-get install ovmf
+
+mkdir efi-hda-dxe/ovmf
+mkdir efi-hda-dxe/hda
+
+cd efi-hda-dxe
+./run_qemu.sh
+
+```
+
+2. From EFI shell load efi-hda-dxe.efi (HDA driver):
+
+```
+load efi-hda-dxe.efi
+```
+
+3. Then load test application
+
+```
+efi-pcm-test.efi
+```
+
+Beware if it works because it ought to make sounds.
+
+# Test AC97
+
+Basically the same steps as before but replace efi-hda-dxe
+with efi-pcm-dxe everywhere.
