@@ -1,8 +1,5 @@
-* TODO add DevicePath
 * TODO add ComponentName and ComponentName2
 * TODO make unsafe PCI I/O interfaces unsafe
-* TODO add install_multiple_protocol_interfaces()
-* TODO add uninstall_multiple_protocol_interfaces()
 * TODO add asynchronous API
 * TODO add sound capture
 * long form NIDs
