@@ -63,6 +63,7 @@ use core::sync::atomic;
 
 use efi_dxe::*;
 use efi_pcm::*;
+mod device_path;
 
 mod iobase;
 use iobase::*;
@@ -471,6 +472,7 @@ struct DeviceContext {
     in_streams: u32,
     out_streams: u32,
     codec: Codec,
+    device_path: Pin<Box<DevicePath>>,
 }
 
 struct EventGuard (uefi::Event);
@@ -2348,7 +2350,14 @@ fn init_context(driver_handle: Handle, controller_handle: Handle, pci: &PciIO, c
     let gcap = GCAP.read(pci)
         .ignore_warning()
         .map(GlobalCapabilities::from)?;
-
+    let controller_path = boot_services()
+        .handle_protocol::<DevicePath>(controller_handle)
+        .ignore_warning()?;
+    let controller_path = unsafe { &*controller_path.get() };
+    let codec_subpath = device_path::make_codec_subpath(codec.0);
+    let device_path = device_path::concat_device_path(controller_path, &codec_subpath.hda.header)
+        .ignore_warning()
+        .map(Pin::new)?;
     let device = Box::new(DeviceContext {
         controller_handle,
         child_handle: controller_handle,                 // TBD: no handle at the moment of context creation
@@ -2356,6 +2365,7 @@ fn init_context(driver_handle: Handle, controller_handle: Handle, pci: &PciIO, c
         in_streams: u32::from(gcap.in_streams),
         out_streams: u32::from(gcap.out_streams),
         codec,
+        device_path,
         audio_interface: Pin::new(Box::new(SimpleAudioOut {
             reset: hda_reset,
             write: hda_write,
@@ -2571,10 +2581,15 @@ fn bus_create_child<B: BusIo>(driver_handle: Handle, controller_handle: Handle, 
     let mut device = init_context(driver_handle, controller_handle, pci, codec)
         .ignore_warning()?;
     let audio_out = &*device.audio_interface;
+    let device_path = &*device.device_path;
     let child_handle = boot_services()
-        .create_child::<SimpleAudioOut>(audio_out)
+        .install_multiple_protocol_interfaces2::<SimpleAudioOut, DevicePath>(
+            None,
+            audio_out,
+            device_path
+        )
         .map_err(|error| {
-            error!("failed to install audio protocol: {:?}", error.status());
+            error!("failed to create child handle: {:?}", error.status());
             error
         })
         .ignore_warning()?;
@@ -2591,9 +2606,10 @@ fn bus_create_child<B: BusIo>(driver_handle: Handle, controller_handle: Handle, 
         Err(error) => {
             error!("failed to open PCI I/O by child: {:?}", error.status());
             boot_services()
-                .uninstall_interface::<SimpleAudioOut>(
+                .uninstall_multiple_protocol_interfaces2::<SimpleAudioOut, DevicePath>(
                     child_handle,
-                    audio_out);
+                    audio_out,
+                    device_path);
             return error.status().into();
         }
         Ok(mut pci) => {
@@ -2677,10 +2693,13 @@ fn hda_stop_child(this: &DriverBinding, controller: Handle, child: Handle) -> ue
     pci.dont_close();
     let audio_out = audio_out.as_proto().get();
     // SAFETY: safe as long as no other references exist in our code
-    let audio_out_ref = unsafe { audio_out.as_ref().unwrap() };
     // Note that this operation does not consume anything
     let device = DeviceContext::from_protocol_mut(boot_services(), audio_out)
         .ok_or_else(|| uefi::Status::INVALID_PARAMETER)?;
+    // SAFETY: safe as long as no other references exist in our code
+    let audio_out = unsafe { audio_out                     // OpenProtocol<'boot>
+                             .as_ref()                     // Option<&SimpleAudioOut>
+                             .unwrap() };
     {
         // SAFETY: safe as long as no other references exist in our code
         let pci = unsafe { pci                           // OpenProtocol<'boot>
@@ -2698,10 +2717,15 @@ fn hda_stop_child(this: &DriverBinding, controller: Handle, child: Handle) -> ue
     if let Err(status) = pci.close() {
         warn!("failed to close PCI I/O: {:?}", status);
     }
+    let device_path = &*device.device_path;
     boot_services()
-        .uninstall_interface::<SimpleAudioOut>(child, audio_out_ref)
+        .uninstall_multiple_protocol_interfaces2::<SimpleAudioOut, DevicePath>(
+            child,
+            audio_out,
+            device_path
+        )
         .map_err(|error| {
-            error!("failed uninstall audio protocol: {:?}", error.status());
+            error!("failed uninstall audio protocols: {:?}", error.status());
             error
         })
         .ignore_warning()?;
@@ -2780,7 +2804,9 @@ extern "efiapi" fn hda_unload(image_handle: Handle) -> Status {
         return uefi::Status::DEVICE_ERROR.into();
     }
     boot_services()
-        .uninstall_interface::<DriverBinding>(image_handle, driver_binding_ref)
+        .uninstall_multiple_protocol_interfaces1::<DriverBinding>(
+            image_handle,
+            driver_binding_ref)
         .map_err(|error| {
             error!("failed to uninstall driver binding: {:?}", error.status());
             error
@@ -2824,7 +2850,9 @@ fn efi_main(handle: uefi::Handle, system_table: SystemTable<Boot>) -> uefi::Stat
     // SAFETY: TBD
     let driver_binding_ref = unsafe { driver_binding.as_ref().unwrap() };
     boot_services()
-        .install_interface::<DriverBinding>(handle, driver_binding_ref)
+        .install_multiple_protocol_interfaces1::<DriverBinding>(
+            Some(handle),
+            driver_binding_ref)
         .map_err(|error| {
             error!("failed to install driver binding: {:?}", error.status());
             // SAFETY: TBD
