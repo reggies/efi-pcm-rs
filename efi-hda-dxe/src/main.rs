@@ -42,9 +42,10 @@ extern crate efi_dxe;
 
 use bitflags::bitflags;
 use uefi::prelude::*;
+use uefi::proto::driver_binding::DriverBinding;
+use uefi::proto::component_name::{ComponentName2,ComponentName};
 use uefi::proto::device_path::DevicePath;
 use uefi::proto::loaded_image::LoadedImage;
-use uefi::proto::driver_binding::DriverBinding;
 use uefi::proto::pci::PciIO;
 use uefi::table::boot::OpenAttribute;
 use uefi::table::boot::BootServices;
@@ -61,6 +62,7 @@ use core::sync::atomic;
 use efi_dxe::*;
 use efi_pcm::*;
 mod device_path;
+mod driver_binding;
 
 mod iobase;
 use iobase::*;
@@ -2824,32 +2826,21 @@ fn efi_main(handle: Handle, system_table: SystemTable<Boot>) -> uefi::Status {
     unsafe {
         DEVICE_CONTEXTS = Some(alloc::vec::Vec::new());
     }
-    // TBD: allocate in runtime pool or .bss
-    let driver_binding = Box::new(DriverBinding::new(
-        hda_start,
-        hda_supported,
-        hda_stop_entry,
-        0x0,
-        handle,
-        handle)
-    );
+    driver_binding::init_driver_binding(handle);
     let loaded_image = boot_services()
         .handle_protocol::<LoadedImage>(handle)
         .ignore_warning()?;
     // SAFETY: TBD
     let loaded_image = unsafe { &mut *loaded_image.get() };
     loaded_image.set_unload_routine(Some(hda_unload));
-    let driver_binding = Box::into_raw(driver_binding);
-    // SAFETY: TBD
-    let driver_binding_ref = unsafe { driver_binding.as_ref().unwrap() };
     boot_services()
-        .install_multiple_protocol_interfaces1::<DriverBinding>(
+        .install_multiple_protocol_interfaces3::<DriverBinding, ComponentName, ComponentName2>(
             Some(handle),
-            driver_binding_ref)
+            &driver_binding::driver_binding(),
+            &driver_binding::component_name(),
+            &driver_binding::component_name2())
         .map_err(|error| {
             error!("failed to install driver binding: {:?}", error.status());
-            // SAFETY: TBD
-            unsafe { Box::from_raw(driver_binding) };
             error
         })
         .ignore_warning()?;
