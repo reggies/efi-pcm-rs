@@ -538,10 +538,6 @@ impl<'a> Drop for PciMappingGuard<'a> {
     }
 }
 
-// SAFETY: we only have a single thread so global mutable statics are safe
-unsafe impl Sync for DeviceContext {}
-unsafe impl Send for DeviceContext {}
-
 static mut DEVICE_CONTEXTS: Option<alloc::vec::Vec<Box<DeviceContext>>> = None;
 
 impl DeviceContext {
