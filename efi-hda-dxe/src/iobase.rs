@@ -12,11 +12,13 @@ pub struct IoBase<T> {
     width: PhantomData<T>
 }
 
-impl<T: Copy + Clone + Default + uefi::proto::pci::ToIoWidth> IoBase<T> {
+impl<T> IoBase<T> {
     pub const fn new(offset: u32) -> IoBase<T> {
         IoBase {offset: offset as u64, width: PhantomData}
     }
+}
 
+impl<T: Copy + Clone + Default + uefi::proto::pci::ToIoWidth> IoBase<T> {
     pub fn read(&self, pci: &PciIO) -> uefi::Result<T> {
         let value = &mut [Default::default()];
         pci.read_mem::<T>(uefi::proto::pci::IoRegister::R0, self.offset, value)

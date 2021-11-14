@@ -17,9 +17,6 @@
 // Because extra parens lead to better readability
 #![allow(unused_parens)]
 
-// For IoBase
-#![feature(const_fn_trait_bound)]
-
 // We are accessing packed structures. Make sure that we
 // don't produce undefined behavior
 #![deny(unaligned_references)]
