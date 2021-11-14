@@ -2854,12 +2854,8 @@ fn efi_main(handle: uefi::Handle, system_table: SystemTable<Boot>) -> uefi::Stat
             error!("failed to install driver binding: {:?}", error.status());
             // SAFETY: TBD
             unsafe { Box::from_raw(driver_binding) };
-            error.status().into()
+            error
         })
-        .ignore_warning()?;
-    info!("initialization complete");
-    boot_services()
-        .handle_protocol::<DriverBinding>(handle)
         .ignore_warning()?;
     info!("hda_main -- ok");
     uefi::Status::SUCCESS
