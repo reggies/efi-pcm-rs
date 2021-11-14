@@ -2817,7 +2817,7 @@ extern "efiapi" fn hda_unload(image_handle: Handle) -> Status {
 }
 
 #[entry]
-fn efi_main(handle: uefi::Handle, system_table: SystemTable<Boot>) -> uefi::Status {
+fn efi_main(handle: Handle, system_table: SystemTable<Boot>) -> uefi::Status {
     efi_dxe::init(handle, &system_table)
         .ignore_warning()?;
     info!("hda_main");
