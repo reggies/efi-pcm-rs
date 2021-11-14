@@ -56,7 +56,6 @@ use core::str;
 use core::fmt::*;
 use core::mem;
 use alloc::boxed::*;
-use core::pin::Pin;
 use core::sync::atomic;
 
 use efi_dxe::*;
@@ -467,11 +466,11 @@ struct DeviceContext {
     controller_handle: Handle,
     child_handle: Handle,
     driver_handle: Handle,
-    audio_interface: Pin<Box<SimpleAudioOut>>,
+    audio_interface: Box<SimpleAudioOut>,
     in_streams: u32,
     out_streams: u32,
     codec: Codec,
-    device_path: Pin<Box<DevicePath>>,
+    device_path: Box<DevicePath>,
 }
 
 struct EventGuard (uefi::Event);
@@ -750,8 +749,8 @@ struct ResponseRing {
 }
 
 struct CommandResponseBuffers<'a> {
-    command_ring: Pin<Box<CommandRing>>,
-    response_ring: Pin<Box<ResponseRing>>,
+    command_ring: Box<CommandRing>,
+    response_ring: Box<ResponseRing>,
     read_pos: usize,
     pci: &'a PciIO,
     corb_dma: Option<PciMappingGuard<'a>>,
@@ -771,10 +770,10 @@ impl<'a> Drop for CommandResponseBuffers<'a> {
 impl<'a> CommandResponseBuffers<'a> {
     fn new(pci: &'a PciIO) -> uefi::Result<CommandResponseBuffers<'a>> {
         let mut crb = CommandResponseBuffers {
-            command_ring: Box::pin(CommandRing {
-                slots: [0; 256]
+            command_ring: Box::new(CommandRing {
+                slots: [0; 256],
             }),
-            response_ring: Box::pin(ResponseRing {
+            response_ring: Box::new(ResponseRing {
                 slots: [ResponseEntry::new(); 256]
             }),
             read_pos: 0,
@@ -807,16 +806,7 @@ impl<'a> CommandResponseBuffers<'a> {
     }
 
     fn init_io(&mut self) -> uefi::Result {
-        // TBD: "Pin also implements DerefMut to the
-        // data, which can be used to access the inner
-        // value. However, DerefMut only provides a
-        // reference that lives for as long as the borrow of
-        // the Pin, not the lifetime of the Pin itself. This
-        // method allows turning the Pin into a reference
-        // with the same lifetime as the original Pin."
-        //   -- https://doc.rust-lang.org/std/pin/struct.Pin.html#method.get_mut
-        let corb = self.pci
-            .map_ex(uefi::proto::pci::IoOperation::BusMasterWrite, &mut *self.command_ring)
+        let corb = self.pci.map_ex(uefi::proto::pci::IoOperation::BusMasterWrite, &mut *self.command_ring)
             .map_err(|error| {
                 error!("corb: pci map returned {:?}", error.status());
                 error
@@ -2351,8 +2341,7 @@ fn init_context(driver_handle: Handle, controller_handle: Handle, pci: &PciIO, c
     let controller_path = unsafe { &*controller_path.get() };
     let codec_subpath = device_path::make_codec_subpath(codec.0);
     let device_path = device_path::concat_device_path(controller_path, &codec_subpath.hda.header)
-        .ignore_warning()
-        .map(Pin::new)?;
+        .ignore_warning()?;
     let device = Box::new(DeviceContext {
         controller_handle,
         child_handle: controller_handle,                 // TBD: no handle at the moment of context creation
@@ -2361,14 +2350,14 @@ fn init_context(driver_handle: Handle, controller_handle: Handle, pci: &PciIO, c
         out_streams: u32::from(gcap.out_streams),
         codec,
         device_path,
-        audio_interface: Pin::new(Box::new(SimpleAudioOut {
+        audio_interface: Box::new(SimpleAudioOut {
             reset: hda_reset,
             write: hda_write,
             tone: hda_tone,
             query_mode: hda_query_mode,
             max_mode: 1,
             capabilities: AUDIO_CAP_RESET | AUDIO_CAP_WRITE | AUDIO_CAP_TONE | AUDIO_CAP_MODE
-        }))
+        })
     });
     Ok (device.into())
 }
