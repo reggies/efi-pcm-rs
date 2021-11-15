@@ -46,7 +46,7 @@ use uefi::proto::driver_binding::DriverBinding;
 use uefi::proto::component_name::{ComponentName2,ComponentName};
 use uefi::proto::device_path::DevicePath;
 use uefi::proto::loaded_image::LoadedImage;
-use uefi::proto::pci::PciIO;
+use uefi::proto::pci::{PciIO, Mappable};
 use uefi::table::boot::OpenAttribute;
 use uefi::table::boot::BootServices;
 
@@ -462,6 +462,8 @@ struct BufferDescriptorListWithBuffers {
     buffers: [SampleBuffer; BUFFER_COUNT]
 }
 
+impl Mappable for BufferDescriptorListWithBuffers {}
+
 struct DeviceContext {
     controller_handle: Handle,
     child_handle: Handle,
@@ -727,6 +729,8 @@ struct CommandRing {
     slots: [u32; 256]
 }
 
+impl Mappable for CommandRing {}
+
 #[derive(Copy, Clone, Debug)]
 #[repr(C, packed)]
 struct ResponseEntry {
@@ -747,6 +751,8 @@ impl ResponseEntry {
 struct ResponseRing {
     slots: [ResponseEntry; 256]
 }
+
+impl Mappable for ResponseRing {}
 
 struct CommandResponseBuffers<'a> {
     command_ring: Box<CommandRing>,
