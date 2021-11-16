@@ -914,14 +914,14 @@ impl<'a> CommandResponseBuffers<'a> {
         // sync response_ring and command_ring
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
         let entry = self.response_ring.slots[self.read_pos];
-        if (entry.response_ex & PCI_RIRB_EX_UNSOLICITED_BIT) != 0 {
-            error!("Got unsolicited event even though not requested!");
-            return Err(uefi::Status::DEVICE_ERROR.into());
-        }
         // Clear interrupt bit because qemu refuses to
         // process CORB without response control interrupt
         // and we don't have proper interrupt routine.
         RIRBSTS.or(self.pci, PCI_RIRBSTS_RESPONSE_BIT)?;
+        if (entry.response_ex & PCI_RIRB_EX_UNSOLICITED_BIT) != 0 {
+            error!("Got unsolicited event even though not requested!");
+            return Err(uefi::Status::DEVICE_ERROR.into());
+        }
         Ok(entry.into())
     }
 
