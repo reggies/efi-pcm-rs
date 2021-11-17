@@ -773,6 +773,21 @@ impl<'a> Drop for CommandResponseBuffers<'a> {
     }
 }
 
+fn sfence() {
+    // TBD: fence does not guarantee volatile memory access order
+    core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+}
+
+fn lfence() {
+    // TBD: fence does not guarantee volatile memory access order
+    core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+}
+
+fn mfence() {
+    // TBD: fence does not guarantee volatile memory access order
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+}
+
 impl<'a> CommandResponseBuffers<'a> {
     fn new(pci: &'a PciIO) -> uefi::Result<CommandResponseBuffers<'a>> {
         let mut crb = CommandResponseBuffers {
@@ -901,6 +916,7 @@ impl<'a> CommandResponseBuffers<'a> {
             return Err(uefi::Status::NOT_READY.into());
         }
         self.command_ring.slots[next_corbwp] = cmd;
+        sfence();
         CORBWP.write(self.pci, next_corbwp as u16)?;
         Ok(().into())
     }
@@ -911,8 +927,7 @@ impl<'a> CommandResponseBuffers<'a> {
             return Err(uefi::Status::NOT_READY.into());
         }
         self.read_pos = (self.read_pos + 1) % self.response_ring.slots.len();
-        // sync response_ring and command_ring
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        lfence();
         let entry = self.response_ring.slots[self.read_pos];
         // Clear interrupt bit because qemu refuses to
         // process CORB without response control interrupt
@@ -922,6 +937,7 @@ impl<'a> CommandResponseBuffers<'a> {
             error!("Got unsolicited event even though not requested!");
             return Err(uefi::Status::DEVICE_ERROR.into());
         }
+        mfence();
         Ok(entry.into())
     }
 
@@ -2385,6 +2401,7 @@ fn fill_bde(buffer: &mut SampleBuffer, descriptor: &mut Descriptor, samples_posi
     let mut bdl_pos = 0;
     while samples_to_copy > 0 {
         let count = (samples.len() - samples_position).min(samples_to_copy);
+        // TBD: copy volatile?
         &mut buffer.samples[bdl_pos..bdl_pos+count]
             .copy_from_slice(&samples[samples_position..samples_position+count]);
         bdl_pos += count;
