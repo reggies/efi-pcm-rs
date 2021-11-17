@@ -46,7 +46,7 @@ use uefi::proto::driver_binding::DriverBinding;
 use uefi::proto::component_name::{ComponentName2,ComponentName};
 use uefi::proto::device_path::DevicePath;
 use uefi::proto::loaded_image::LoadedImage;
-use uefi::proto::pci::{PciIO, Mappable};
+use uefi::proto::pci::{PciIO, Mappable, MappingEx};
 use uefi::table::boot::OpenAttribute;
 use uefi::table::boot::BootServices;
 
@@ -57,6 +57,8 @@ use core::fmt::*;
 use core::mem;
 use alloc::boxed::*;
 use core::sync::atomic;
+use core::pin::Pin;
+use core::cell::UnsafeCell;
 
 use efi_dxe::*;
 use efi_pcm::*;
@@ -504,43 +506,6 @@ impl DerefMut for EventGuard {
     }
 }
 
-struct PciMappingGuard<'a> {
-    pci: &'a PciIO,
-    mapping: Option<uefi::proto::pci::Mapping>
-}
-
-impl<'a> PciMappingGuard<'a> {
-    fn wrap(pci: &'a PciIO, mapping: uefi::proto::pci::Mapping) -> PciMappingGuard<'a> {
-        PciMappingGuard {
-            pci,
-            mapping: Some(mapping)
-        }
-    }
-}
-
-impl<'a> Deref for PciMappingGuard<'a> {
-    type Target = uefi::proto::pci::Mapping;
-    fn deref(&self) -> &Self::Target {
-        self.mapping.as_ref().unwrap()
-    }
-}
-
-impl<'a> DerefMut for PciMappingGuard<'a> {
-    fn deref_mut(&mut self) -> &mut uefi::proto::pci::Mapping {
-        self.mapping.as_mut().unwrap()
-    }
-}
-
-impl<'a> Drop for PciMappingGuard<'a> {
-    fn drop(&mut self) {
-        let mapping = self.mapping.take().unwrap();
-        info!("dropping PCI I/O mapping {:#x}", mapping.device_address());
-        if let Err(error) = self.pci.unmap(mapping) {
-            error!("unmap operation failed: {:?}", error.status());
-        }
-    }
-}
-
 static mut DEVICE_CONTEXTS: Option<alloc::vec::Vec<Box<DeviceContext>>> = None;
 
 impl DeviceContext {
@@ -755,12 +720,10 @@ struct ResponseRing {
 impl Mappable for ResponseRing {}
 
 struct CommandResponseBuffers<'a> {
-    command_ring: Box<CommandRing>,
-    response_ring: Box<ResponseRing>,
     read_pos: usize,
     pci: &'a PciIO,
-    corb_dma: Option<PciMappingGuard<'a>>,
-    rirb_dma: Option<PciMappingGuard<'a>>,
+    corb_dma: Option<MappingEx<'a, CommandRing>>,
+    rirb_dma: Option<MappingEx<'a, ResponseRing>>,
 }
 
 impl<'a> Drop for CommandResponseBuffers<'a> {
@@ -790,27 +753,80 @@ fn mfence() {
 
 impl<'a> CommandResponseBuffers<'a> {
     fn new(pci: &'a PciIO) -> uefi::Result<CommandResponseBuffers<'a>> {
-        let mut crb = CommandResponseBuffers {
-            command_ring: Box::new(CommandRing {
-                slots: [0; 256],
-            }),
-            response_ring: Box::new(ResponseRing {
-                slots: [ResponseEntry::new(); 256]
-            }),
-            read_pos: 0,
-            corb_dma: None,
-            rirb_dma: None,
-            pci
-        };
-        crb.init_io()
+        let corb = pci
+            .map_ex(uefi::proto::pci::IoOperation::BusMasterWrite)
             .map_err(|error| {
-                error!("failed to initialize CORB/RIRB interface: {:?}", error.status());
+                error!("corb: pci map returned {:?}", error.status());
                 error
-            })?;
-        Ok(crb.into())
+            })
+            .ignore_warning()?;
+        let rirb = pci
+            .map_ex(uefi::proto::pci::IoOperation::BusMasterWrite)
+            .map_err(|error| {
+                error!("rirb: pci map returned {:?}", error.status());
+                error
+            })
+            .ignore_warning()?;
+        if (corb.device_address() & 0b1111111) != 0 {
+            error!("CORB address {:#x} is not supported", corb.device_address());
+            return Err(uefi::Status::UNSUPPORTED.into());
+        }
+        if (rirb.device_address() & 0b1111111) != 0 {
+            error!("RIRB address {:#x} is not supported", corb.device_address());
+            return Err(uefi::Status::UNSUPPORTED.into());
+        }
+        let corbszcap = CORBSIZE.read(pci)
+            .ignore_warning()?;
+        if (corbszcap & PCI_CORBSIZE_CAP_256_BIT) == 0 {
+            error!("CORB size capabilities are not supported: {:#x}", corbszcap);
+            return Err(uefi::Status::UNSUPPORTED.into());
+        }
+        let rirbszcap = RIRBSIZE.read(pci).ignore_warning()?;
+        if (rirbszcap & PCI_RIRBSIZE_CAP_256_BIT) == 0 {
+            error!("RIRB size capabilities are not supported: {:#x}", rirbszcap);
+            return Err(uefi::Status::UNSUPPORTED.into());
+        }
+        // Ensure that CORBCTL_DMA=0 and RIRBCTL_DMA=0
+        CORBCTL.wait(pci, 1000, PCI_CORBCTL_DMA_BIT, 0)
+            .map_err(|e| {error!("wait CORBCTL.DMA=0: {:?}", e.status()); e})?;
+        RIRBCTL.wait(pci, 1000, PCI_RIRBCTL_DMA_BIT, 0)
+            .map_err(|e| {error!("wait RIRBCTL.DMA=0: {:?}", e.status()); e})?;
+        // Program the CORB base address
+        CORBLBASE.write(pci, (corb.device_address() & 0xffff_ffff) as u32)?;
+        CORBUBASE.write(pci, ((corb.device_address() >> 32) & 0xffff_ffff) as u32)?;
+        // Wrap around at 1Kib = 256 entries
+        CORBSIZE.update(pci, 0b10, !PCI_CORBSIZE_RSVDP_MASK)?;
+        // Reset the read pointer
+        CORBRP.or(pci, PCI_CORBRP_RST_BIT)?;
+        CORBRP.wait(pci, 1000, PCI_CORBRP_RST_BIT, PCI_CORBRP_RST_BIT)
+            .map_err(|e| {error!("wait CORBRP.RST=1: {:?}", e.status()); e})?;
+        CORBRP.and(pci, !PCI_CORBRP_RST_BIT)?;
+        CORBRP.wait(pci, 1000, PCI_CORBRP_RST_BIT, 0)
+            .map_err(|e| {error!("wait CORBRP.RST=0: {:?}", e.status()); e})?;
+        // Reset the write pointer
+        CORBWP.update(pci, 0, !PCI_CORBWP_RSVDP_MASK)?;
+        CORBCTL.or(pci, PCI_CORBCTL_DMA_BIT)?;
+        // Program the RIRB base address
+        RIRBLBASE.write(pci, (rirb.device_address() & 0xffff_ffff) as u32)?;
+        RIRBUBASE.write(pci, ((rirb.device_address() >> 32) & 0xffff_ffff) as u32)?;
+        // Wrap around at 2Kib = 256 entries
+        RIRBSIZE.update(pci, 0b10, !PCI_RIRBSIZE_RSVDP_MASK)?;
+        // Reset RIRB write pointer
+        RIRBWP.update(pci, PCI_RIRBWP_RST_BIT, !PCI_RIRBWP_RSVDP_MASK)?;
+        // TBD: qemu-2.11 does not process CORB without IRQ bit or with RINTCNT=0
+        RINTCNT.update(pci, 0x1, !PCI_RINTCNT_RSVDP_MASK)?;
+        RIRBCTL.or(pci, PCI_RIRBCTL_DMA_BIT | PCI_RIRBCTL_IRQ_BIT)?;
+
+        Ok(CommandResponseBuffers {
+            read_pos: 0,
+            corb_dma: Some(corb),
+            rirb_dma: Some(rirb),
+            pci
+        }.into())
     }
 
     fn trace(&self) -> uefi::Result {
+        // TBD: reading sticky bits is undesired
         let corbwp = CORBWP.read(self.pci).ignore_warning()?;
         let corbrp = CORBRP.read(self.pci).ignore_warning()?;
         let corbctl = CORBCTL.read(self.pci).ignore_warning()?;
@@ -826,78 +842,6 @@ impl<'a> CommandResponseBuffers<'a> {
         Ok(().into())
     }
 
-    fn init_io(&mut self) -> uefi::Result {
-        let corb = self.pci.map_ex(uefi::proto::pci::IoOperation::BusMasterWrite, &mut *self.command_ring)
-            .map_err(|error| {
-                error!("corb: pci map returned {:?}", error.status());
-                error
-            })
-            .ignore_warning()?;
-        // Drop will unmap the memory buffer for us
-        let corb = PciMappingGuard::wrap(self.pci, corb);
-        let rirb = self.pci
-            .map_ex(uefi::proto::pci::IoOperation::BusMasterWrite, &mut *self.response_ring)
-            .map_err(|error| {
-                error!("rirb: pci map returned {:?}", error.status());
-                error
-            })
-            .ignore_warning()?;
-        // Drop will unmap the memory buffer for us
-        let rirb = PciMappingGuard::wrap(self.pci, rirb);
-        if (corb.device_address() & 0b1111111) != 0 {
-            error!("CORB address {:#x} is not supported", corb.device_address());
-            return Err(uefi::Status::UNSUPPORTED.into());
-        }
-        if (rirb.device_address() & 0b1111111) != 0 {
-            error!("RIRB address {:#x} is not supported", corb.device_address());
-            return Err(uefi::Status::UNSUPPORTED.into());
-        }
-        let corbszcap = CORBSIZE.read(self.pci)
-            .ignore_warning()?;
-        if (corbszcap & PCI_CORBSIZE_CAP_256_BIT) == 0 {
-            error!("CORB size capabilities are not supported: {:#x}", corbszcap);
-            return Err(uefi::Status::UNSUPPORTED.into());
-        }
-        let rirbszcap = RIRBSIZE.read(self.pci).ignore_warning()?;
-        if (rirbszcap & PCI_RIRBSIZE_CAP_256_BIT) == 0 {
-            error!("RIRB size capabilities are not supported: {:#x}", rirbszcap);
-            return Err(uefi::Status::UNSUPPORTED.into());
-        }
-        // Ensure that CORBCTL_DMA=0 and RIRBCTL_DMA=0
-        CORBCTL.wait(self.pci, 1000, PCI_CORBCTL_DMA_BIT, 0)
-            .map_err(|e| {error!("wait CORBCTL.DMA=0: {:?}", e.status()); e})?;
-        RIRBCTL.wait(self.pci, 1000, PCI_RIRBCTL_DMA_BIT, 0)
-            .map_err(|e| {error!("wait RIRBCTL.DMA=0: {:?}", e.status()); e})?;
-        // Program the CORB base address
-        CORBLBASE.write(self.pci, (corb.device_address() & 0xffff_ffff) as u32)?;
-        CORBUBASE.write(self.pci, ((corb.device_address() >> 32) & 0xffff_ffff) as u32)?;
-        // Wrap around at 1Kib = 256 entries
-        CORBSIZE.update(self.pci, 0b10, !PCI_CORBSIZE_RSVDP_MASK)?;
-        // Reset the read pointer
-        CORBRP.or(self.pci, PCI_CORBRP_RST_BIT)?;
-        CORBRP.wait(self.pci, 1000, PCI_CORBRP_RST_BIT, PCI_CORBRP_RST_BIT)
-            .map_err(|e| {error!("wait CORBRP.RST=1: {:?}", e.status()); e})?;
-        CORBRP.and(self.pci, !PCI_CORBRP_RST_BIT)?;
-        CORBRP.wait(self.pci, 1000, PCI_CORBRP_RST_BIT, 0)
-            .map_err(|e| {error!("wait CORBRP.RST=0: {:?}", e.status()); e})?;
-        // Reset the write pointer
-        CORBWP.update(self.pci, 0, !PCI_CORBWP_RSVDP_MASK)?;
-        CORBCTL.or(self.pci, PCI_CORBCTL_DMA_BIT)?;
-        // Program the RIRB base address
-        RIRBLBASE.write(self.pci, (rirb.device_address() & 0xffff_ffff) as u32)?;
-        RIRBUBASE.write(self.pci, ((rirb.device_address() >> 32) & 0xffff_ffff) as u32)?;
-        // Wrap around at 2Kib = 256 entries
-        RIRBSIZE.update(self.pci, 0b10, !PCI_RIRBSIZE_RSVDP_MASK)?;
-        // Reset RIRB write pointer
-        RIRBWP.update(self.pci, PCI_RIRBWP_RST_BIT, !PCI_RIRBWP_RSVDP_MASK)?;
-        // TBD: qemu-2.11 does not process CORB without IRQ bit or with RINTCNT=0
-        RINTCNT.update(self.pci, 0x1, !PCI_RINTCNT_RSVDP_MASK)?;
-        RIRBCTL.or(self.pci, PCI_RIRBCTL_DMA_BIT | PCI_RIRBCTL_IRQ_BIT)?;
-        self.corb_dma = Some(corb);
-        self.rirb_dma = Some(rirb);
-        Ok(().into())
-    }
-
     fn uninit_io(&mut self) -> uefi::Result {
         RIRBCTL.and(self.pci, !PCI_RIRBCTL_DMA_BIT)?;
         CORBCTL.and(self.pci, !PCI_CORBCTL_DMA_BIT)?;
@@ -909,13 +853,19 @@ impl<'a> CommandResponseBuffers<'a> {
     fn send(&mut self, cmd: u32) -> uefi::Result {
         let corbwp = CORBWP.read(self.pci)
             .ignore_warning()?;
-        let next_corbwp = (corbwp as usize + 1) % self.command_ring.slots.len();
+        // SAFETY: buffer mutation at (CORBWP + 1) % CORBWSZ does not overlapp with DMA engine
+        let command_ring = unsafe { &mut *self.corb_dma.as_mut().unwrap().get_mut() };
+        let next_corbwp = (corbwp as usize + 1) % command_ring.slots.len();
         let corbrp = CORBRP.read(self.pci)
             .ignore_warning()?;
         if next_corbwp == corbrp as usize {
             return Err(uefi::Status::NOT_READY.into());
         }
-        self.command_ring.slots[next_corbwp] = cmd;
+        let command_slot_ptr = (&mut command_ring.slots[next_corbwp]) as *mut u32;
+        // SAFETY: the pointer is valid and no object should be dropped => safe
+        unsafe {
+            core::ptr::write_volatile(command_slot_ptr, cmd);
+        }
         sfence();
         CORBWP.write(self.pci, next_corbwp as u16)?;
         Ok(().into())
@@ -926,9 +876,15 @@ impl<'a> CommandResponseBuffers<'a> {
         if rirbwp as usize == self.read_pos {
             return Err(uefi::Status::NOT_READY.into());
         }
-        self.read_pos = (self.read_pos + 1) % self.response_ring.slots.len();
+        let response_ring = unsafe { &*self.rirb_dma.as_ref().unwrap().get() };
+        self.read_pos = (self.read_pos + 1) % response_ring.slots.len();
         lfence();
-        let entry = self.response_ring.slots[self.read_pos];
+        let entry_ptr = (&response_ring.slots[self.read_pos]) as *const ResponseEntry;
+        // SAFETY: pointer is valid, properly aligned and
+        //         data is told to be properly initialized.
+        let entry = unsafe {
+            core::ptr::read_volatile(entry_ptr)
+        };
         // Clear interrupt bit because qemu refuses to
         // process CORB without response control interrupt
         // and we don't have proper interrupt routine.
@@ -2178,36 +2134,33 @@ impl<'a> DmaControl for Loop<'a> {
 }
 
 fn stream_play_loop(device: &mut DeviceContext, pci: &PciIO, duration: u64, samples: &[i16], sampling_rate: u32, channel_count: u8) -> uefi::Result {
-    let bdl = Box::<BufferDescriptorListWithBuffers>::new_uninit();
-    let mut bdl = unsafe { bdl.assume_init() };
-
-    let bdl_dma = pci
-        .map_ex(uefi::proto::pci::IoOperation::BusMasterWrite, &mut *bdl)
+    let mut bdl_dma = pci
+        .map_ex::<BufferDescriptorListWithBuffers>(uefi::proto::pci::IoOperation::BusMasterWrite)
         .map_err(|error| {
             error!("map operation failed: {:?}", error.status());
             error
         })
         .ignore_warning()?;
-    // Drop will unmap the memory buffer for us
-    let bdl_dma = PciMappingGuard::wrap(pci, bdl_dma);
 
     let (format, closest_rate) = stream_select_rate(device, pci, sampling_rate, channel_count)
         .ignore_warning()?;
 
     info!("stream_play_loop: use {} sample rate", closest_rate);
 
-    init_bdl(&bdl_dma, &mut *bdl);
+    // SAFETY: this DMA buffer should not be mutated by the codec
+    init_bdl(bdl_dma.mapping().device_address(), unsafe { &mut *bdl_dma.get_mut() });
 
     let loop_buffers = BUFFER_COUNT;
     let loop_samples = BUFFER_COUNT * BUFFER_SIZE;
 
-    let mut control = Loop::new(&mut *bdl, samples);
+    // SAFETY: this DMA buffer should not be mutated by the codec
+    let mut control = Loop::new(unsafe { &mut *bdl_dma.get_mut() }, samples);
 
     let mut bus = make_bus_io(pci).ignore_warning()?;
 
     // TBD: reset the stream? we could only modify CBL after _some_ reset
     codec_setup_stream(&mut bus, device, pci, device.codec, format)?;
-    stream_setup(device, pci, &bdl_dma, loop_buffers as u32, loop_samples as u32, format)?;
+    stream_setup(device, pci, bdl_dma.mapping(), loop_buffers as u32, loop_samples as u32, format)?;
 
     stream_loop(device, pci, &mut control, samples.len() as u64, channel_count, sampling_rate as u64, duration as u64)
         .map_err(|error| {
@@ -2333,7 +2286,7 @@ extern "efiapi" fn hda_query_mode(this: &mut SimpleAudioOut, index: usize, mode:
     uefi::Status::SUCCESS
 }
 
-fn init_bdl(mapping: &uefi::proto::pci::Mapping, bdl: &mut BufferDescriptorListWithBuffers) {
+fn init_bdl(device_address: u64, bdl: &mut BufferDescriptorListWithBuffers) {
     let bdl_base = bdl as *mut BufferDescriptorListWithBuffers as *mut u8;
     for (descriptor, buffer) in bdl.descriptors.iter_mut().zip(bdl.buffers.iter()) {
         // SAFETY: see dma-buffer miri test #1
@@ -2344,7 +2297,7 @@ fn init_bdl(mapping: &uefi::proto::pci::Mapping, bdl: &mut BufferDescriptorListW
         // TBD: UB if mapping address or bdl_base is not a valid pointer
         // SAFETY: TBD
         let descriptor_address = unsafe {
-            (mapping.device_address() as *const u8)
+            (device_address as *const u8)
                 .offset(buffer_offset)
         };
         descriptor.address = descriptor_address as u64;
