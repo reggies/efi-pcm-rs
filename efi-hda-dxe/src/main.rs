@@ -2733,7 +2733,9 @@ extern "efiapi" fn hda_unload(image_handle: Handle) -> Status {
             error
         })
         .ignore_warning()?;
-    // SAFETY: TBD
+    // SAFETY: we do not offend uniqueness of driver
+    //         binding mutable references and also we do not
+    //         introduce race conditions
     let driver_binding_ref = unsafe { driver_binding.as_proto().get().as_ref().unwrap() };
     let handles = boot_services()
         .find_handles::<PciIO>()
@@ -2751,7 +2753,7 @@ extern "efiapi" fn hda_unload(image_handle: Handle) -> Status {
     for controller in handles {
         // If our drivers does not manage the specified
         // controller (i.e. does not hold it open BY_DRIVER)
-        // then the disconnect will succeed
+        // then the disconnect will succeed (per UEFI spec)
         let result = boot_services()
             .disconnect(
                 controller,
@@ -2774,11 +2776,6 @@ extern "efiapi" fn hda_unload(image_handle: Handle) -> Status {
             error
         })
         .ignore_warning()?;
-    // Driver binding is already disconnected and it is
-    // about to be destroyed so no need to close it.
-    let driver_binding = uefi::table::boot::leak(driver_binding);
-    // SAFETY: TBD
-    unsafe { Box::from_raw(driver_binding.get()) };
     info!("hda_unload -- ok");
     // Cleanup allocator and logging facilities
     efi_dxe::unload(image_handle);
