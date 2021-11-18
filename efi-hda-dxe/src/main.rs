@@ -983,11 +983,23 @@ impl<'a> BusIo for Immediate<'a> {
 }
 
 fn exec_immediate(pci: &PciIO, cmd: u32) -> uefi::Result<u32> {
-    IRS.wait(pci, 10000, PCI_IRS_ICB_BIT, 0)?;
+    // Note that if this bit stuck at 1 than it is likely
+    // that the command was sent to non-existant codec. Bus
+    // reset is required under such circumstances.
+    if let Err(error) = IRS.wait(pci, 1000, PCI_IRS_ICB_BIT, 0) {
+        // As qemu guest it is also possible to disregard
+        // timeout and reset ICB bit.
+        if error.status() == uefi::Status::TIMEOUT {
+            warn!("ICB bit is stuck. Reseting");
+            IRS.and(pci, !PCI_IRS_ICB_BIT)?;
+        } else {
+            return Err(error);
+        }
+    }
     IRS.or(pci, PCI_IRS_IRV_BIT)?;
     IC.write(pci, cmd)?;
     IRS.or(pci, PCI_IRS_ICB_BIT)?;
-    IRS.wait(pci, 10000, (PCI_IRS_IRV_BIT | PCI_IRS_ICB_BIT), PCI_IRS_IRV_BIT)?;
+    IRS.wait(pci, 1000, (PCI_IRS_IRV_BIT | PCI_IRS_ICB_BIT), PCI_IRS_IRV_BIT)?;
     let result = IR.read(pci).ignore_warning()?;
     Ok(result.into())
 }
@@ -1156,6 +1168,10 @@ fn bus_probe_codecs(pci: &PciIO, codec_mask: u16) -> uefi::Result<alloc::vec::Ve
             }
             Err(error) => {
                 info!("codec {:#x} is not detected: {:?}", codec, error.status());
+                // TBD: for immediate interface command to
+                //      work we must either reset the bus once we
+                //      addressed a non-existant codec or
+                //      manually reset IRS.ICB bit
             }
         }
     }
