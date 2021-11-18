@@ -1163,8 +1163,9 @@ fn bus_probe_codecs(pci: &PciIO, codec_mask: u16) -> uefi::Result<alloc::vec::Ve
         match bus.exec(cmd).ignore_warning() {
             Ok(vid) => {
                 info!("codec {:#x} is detected, response:{:#x}", codec, vid);
-                codec_trace_config(&mut bus, pci, Codec(*codec))?;
-                codecs.push(*codec);
+                if let Ok(..) = codec_trace_config(&mut bus, pci, Codec(*codec)) {
+                    codecs.push(*codec);
+                }
             }
             Err(error) => {
                 info!("codec {:#x} is not detected: {:?}", codec, error.status());
