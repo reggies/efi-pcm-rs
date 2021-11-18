@@ -787,6 +787,8 @@ impl<'a> CommandResponseBuffers<'a> {
             return Err(uefi::Status::UNSUPPORTED.into());
         }
         // Ensure that CORBCTL_DMA=0 and RIRBCTL_DMA=0
+        RIRBCTL.and(pci, !PCI_RIRBCTL_DMA_BIT)?;
+        CORBCTL.and(pci, !PCI_CORBCTL_DMA_BIT)?;
         CORBCTL.wait(pci, 1000, PCI_CORBCTL_DMA_BIT, 0)
             .map_err(|e| {error!("wait CORBCTL.DMA=0: {:?}", e.status()); e})?;
         RIRBCTL.wait(pci, 1000, PCI_RIRBCTL_DMA_BIT, 0)
