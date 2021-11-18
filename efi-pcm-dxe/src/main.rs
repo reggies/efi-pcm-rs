@@ -650,16 +650,20 @@ fn loop_samples(pci: &PciIO, samples: &[i16], channel_count: u8, sampling_rate: 
     // 4.2. poll reset bit =0 in control register byte
     // 4.3. wait for playback to finish
     //
-    let mapping = pci
-        .map(
-            uefi::proto::pci::IoOperation::BusMasterWrite,
-            &mut *device.bdl as *mut BufferDescriptorListWithBuffers as *mut _,
-            mem::size_of::<BufferDescriptorListWithBuffers>())
-        .map_err(|error| {
-            error!("map operation failed: {:?}", error.status());
-            error
-        })
-        .warning_as_error()?;
+
+    // SAFETY: works on my machine
+    let mapping = unsafe {
+        pci
+            .map(
+                uefi::proto::pci::IoOperation::BusMasterWrite,
+                &mut *device.bdl as *mut BufferDescriptorListWithBuffers as *mut _,
+                mem::size_of::<BufferDescriptorListWithBuffers>())
+            .map_err(|error| {
+                error!("map operation failed: {:?}", error.status());
+                error
+            })
+            .warning_as_error()?
+    };
     // Drop will unmap the memory buffer for us
     let mapping = PciMappingGuard::wrap(pci, mapping);
     // TBD: creating reference to uninitialized object to
@@ -715,16 +719,19 @@ fn loop_samples(pci: &PciIO, samples: &[i16], channel_count: u8, sampling_rate: 
 fn play_samples(pci: &PciIO, samples: &[i16], channel_count: u8, sampling_rate: u32, device: &mut DeviceContext) -> uefi::Result {
     let mut total_offset = 0;
     let mut total_sample_count = samples.len();
-    let mapping = pci
-        .map(
-            uefi::proto::pci::IoOperation::BusMasterWrite,
-            &mut *device.bdl as *mut BufferDescriptorListWithBuffers as *mut _,
-            mem::size_of::<BufferDescriptorListWithBuffers>())
-        .map_err(|error| {
-            error!("map operation failed: {:?}", error.status());
-            error
-        })
-        .warning_as_error()?;
+    // SAFETY: works on my machine
+    let mapping = unsafe {
+        pci
+            .map(
+                uefi::proto::pci::IoOperation::BusMasterWrite,
+                &mut *device.bdl as *mut BufferDescriptorListWithBuffers as *mut _,
+                mem::size_of::<BufferDescriptorListWithBuffers>())
+            .map_err(|error| {
+                error!("map operation failed: {:?}", error.status());
+                error
+            })
+            .warning_as_error()?
+    };
     // Drop will unmap the memory buffer for us
     let mapping = PciMappingGuard::wrap(pci, mapping);
     // TBD: creating reference to uninitialized object to
