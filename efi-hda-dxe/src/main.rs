@@ -200,6 +200,8 @@ const PCI_CORBCTL_DMA_BIT: u8 = BIT1 as u8;
 const PCI_CORBRP_RST_BIT: u16 = BIT15 as u16;
 const PCI_CORBBASE_MASK: u32 = bitspan(31, 7) as u32;
 const PCI_CORBSIZE_RSVDP_MASK: u8 = bitspan(3, 2) as u8;
+const PCI_CORBSIZE_SZ_MASK: u8 = bitspan(1, 0) as u8;
+const PCI_CORBSIZE_RO_MASK: u8 = bitspan(7, 4) as u8;
 const PCI_CORBWP_RSVDP_MASK: u16 = bitspan(15, 8) as u16;
 const PCI_CORBSIZE_SZCAP_MASK: u8 = bitspan(7, 4) as u8;
 const PCI_GCTL_RST_BIT: u32 = BIT0;
@@ -229,6 +231,8 @@ const PCI_RIRBWP_RST_BIT: u16 = BIT15 as u16;
 const PCI_RIRBWP_RSVDP_MASK: u16 = bitspan(14, 8) as u16;
 const PCI_RINTCNT_RSVDP_MASK: u16 = bitspan(15, 8) as u16;
 const PCI_RIRBSIZE_RSVDP_MASK: u8 = bitspan(3, 2) as u8;
+const PCI_RIRBSIZE_RO_MASK: u8 = bitspan(7, 4) as u8;
+const PCI_RIRBSIZE_SZ_MASK: u8 = bitspan(1, 0) as u8;
 const PCI_STATESTS_INT_MASK: u16 = (BIT0 | BIT1 | BIT2) as u16;
 const PCI_STATESTS_SDI0_BIT: u16 = BIT0 as u16;
 const PCI_STATESTS_SDI1_BIT: u16 = BIT1 as u16;
@@ -275,6 +279,16 @@ const PCI_INTSTS_GIS_BIT: u32 = BIT31;
 const PCI_INTCTL_SIE_MASK: u32 = !(PCI_INTCTL_CIE_BIT | PCI_INTCTL_GIE_BIT);
 const PCI_INTCTL_CIE_BIT: u32 = BIT30;
 const PCI_INTCTL_GIE_BIT: u32 = BIT31;
+
+// CORBSZ sizes
+const PCI_CORBSIZE_SZ_256: u8 = 0b10;
+const PCI_CORBSIZE_SZ_16: u8 = 0b01;
+const PCI_CORBSIZE_SZ_2: u8 = 0b00;
+
+// RIRBSZ sizes
+const PCI_RIRBSIZE_SZ_256: u8 = 0b10;
+const PCI_RIRBSIZE_SZ_16: u8 = 0b01;
+const PCI_RIRBSIZE_SZ_2: u8 = 0b00;
 
 // 1.2.42 SDFMT
 const PCM_FMT_44K_BIT: u16 = BIT14 as u16;
@@ -720,6 +734,8 @@ struct ResponseRing {
 impl Mappable for ResponseRing {}
 
 struct CommandResponseBuffers<'a> {
+    corbsize: usize,
+    rirbsize: usize,
     read_pos: usize,
     pci: &'a PciIO,
     corb_dma: Option<MappingEx<'a, CommandRing>>,
@@ -775,17 +791,31 @@ impl<'a> CommandResponseBuffers<'a> {
             error!("RIRB address {:#x} is not supported", corb.device_address());
             return Err(uefi::Status::UNSUPPORTED.into());
         }
+
         let corbszcap = CORBSIZE.read(pci)
             .ignore_warning()?;
-        if (corbszcap & PCI_CORBSIZE_CAP_256_BIT) == 0 {
-            error!("CORB size capabilities are not supported: {:#x}", corbszcap);
-            return Err(uefi::Status::UNSUPPORTED.into());
-        }
-        let rirbszcap = RIRBSIZE.read(pci).ignore_warning()?;
-        if (rirbszcap & PCI_RIRBSIZE_CAP_256_BIT) == 0 {
-            error!("RIRB size capabilities are not supported: {:#x}", rirbszcap);
-            return Err(uefi::Status::UNSUPPORTED.into());
-        }
+        let corbsize = match (corbszcap & PCI_CORBSIZE_SZ_MASK) {
+            PCI_CORBSIZE_SZ_256 => 256,
+            PCI_CORBSIZE_SZ_16 => 16,
+            PCI_CORBSIZE_SZ_2 => 2,
+            _ => {
+                error!("CORB size capabilities are not supported: {:#x}", corbszcap);
+                return Err(uefi::Status::UNSUPPORTED.into());
+            }
+        };
+
+        let rirbszcap = RIRBSIZE.read(pci)
+            .ignore_warning()?;
+        let rirbsize = match (rirbszcap & PCI_RIRBSIZE_SZ_MASK) {
+            PCI_RIRBSIZE_SZ_256 => 256,
+            PCI_RIRBSIZE_SZ_16 => 16,
+            PCI_RIRBSIZE_SZ_2 => 2,
+            _ => {
+                error!("RIRB size capabilities are not supported: {:#x}", rirbszcap);
+                return Err(uefi::Status::UNSUPPORTED.into());
+            }
+        };
+
         // Ensure that CORBCTL_DMA=0 and RIRBCTL_DMA=0
         RIRBCTL.and(pci, !PCI_RIRBCTL_DMA_BIT)?;
         CORBCTL.and(pci, !PCI_CORBCTL_DMA_BIT)?;
@@ -796,8 +826,7 @@ impl<'a> CommandResponseBuffers<'a> {
         // Program the CORB base address
         CORBLBASE.write(pci, (corb.device_address() & 0xffff_ffff) as u32)?;
         CORBUBASE.write(pci, ((corb.device_address() >> 32) & 0xffff_ffff) as u32)?;
-        // Wrap around at 1Kib = 256 entries
-        CORBSIZE.update(pci, 0b10, !PCI_CORBSIZE_RSVDP_MASK)?;
+        CORBSIZE.update(pci, (corbszcap & PCI_CORBSIZE_SZ_MASK), !PCI_CORBSIZE_RSVDP_MASK)?;
         // Reset the read pointer
         CORBRP.or(pci, PCI_CORBRP_RST_BIT)?;
         CORBRP.wait(pci, 1000, PCI_CORBRP_RST_BIT, PCI_CORBRP_RST_BIT)
@@ -811,8 +840,7 @@ impl<'a> CommandResponseBuffers<'a> {
         // Program the RIRB base address
         RIRBLBASE.write(pci, (rirb.device_address() & 0xffff_ffff) as u32)?;
         RIRBUBASE.write(pci, ((rirb.device_address() >> 32) & 0xffff_ffff) as u32)?;
-        // Wrap around at 2Kib = 256 entries
-        RIRBSIZE.update(pci, 0b10, !PCI_RIRBSIZE_RSVDP_MASK)?;
+        RIRBSIZE.update(pci, (rirbszcap & PCI_RIRBSIZE_SZ_MASK), !PCI_RIRBSIZE_RSVDP_MASK)?;
         // Reset RIRB write pointer
         RIRBWP.update(pci, PCI_RIRBWP_RST_BIT, !PCI_RIRBWP_RSVDP_MASK)?;
         // TBD: qemu-2.11 does not process CORB without IRQ bit or with RINTCNT=0
@@ -821,6 +849,8 @@ impl<'a> CommandResponseBuffers<'a> {
 
         Ok(CommandResponseBuffers {
             read_pos: 0,
+            corbsize,
+            rirbsize,
             corb_dma: Some(corb),
             rirb_dma: Some(rirb),
             pci
@@ -857,7 +887,7 @@ impl<'a> CommandResponseBuffers<'a> {
             .ignore_warning()?;
         // SAFETY: buffer mutation at (CORBWP + 1) % CORBWSZ does not overlapp with DMA engine
         let command_ring = unsafe { &mut *self.corb_dma.as_mut().unwrap().get_mut() };
-        let next_corbwp = (corbwp as usize + 1) % command_ring.slots.len();
+        let next_corbwp = (corbwp as usize + 1) % self.corbsize;
         let corbrp = CORBRP.read(self.pci)
             .ignore_warning()?;
         if next_corbwp == corbrp as usize {
@@ -879,7 +909,7 @@ impl<'a> CommandResponseBuffers<'a> {
             return Err(uefi::Status::NOT_READY.into());
         }
         let response_ring = unsafe { &*self.rirb_dma.as_ref().unwrap().get() };
-        self.read_pos = (self.read_pos + 1) % response_ring.slots.len();
+        self.read_pos = (self.read_pos + 1) % self.rirbsize;
         lfence();
         let entry_ptr = (&response_ring.slots[self.read_pos]) as *const ResponseEntry;
         // SAFETY: pointer is valid, properly aligned and
