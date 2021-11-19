@@ -1,3 +1,5 @@
+// NB: vbox version refered to in the comments is 6.1.22 r144080
+// NB: qemu verison refered to in the comments is 2.11.1
 // NB: HDA specification referenced in this source code is
 //     HDA Spec 1.0a, June 17, 2011
 // NB. Windows 10 lacks sound output using ich6-intel-hda
@@ -198,6 +200,7 @@ const fn bitspan(h: usize, l: usize) -> u64 {
 const PCI_CORBCTL_CMEI_BIT: u8 = BIT0 as u8;
 const PCI_CORBCTL_DMA_BIT: u8 = BIT1 as u8;
 const PCI_CORBRP_RST_BIT: u16 = BIT15 as u16;
+const PCI_CORBRP_RSVDP_MASK: u16 = bitspan(14, 8) as u16;
 const PCI_CORBBASE_MASK: u32 = bitspan(31, 7) as u32;
 const PCI_CORBSIZE_RSVDP_MASK: u8 = bitspan(3, 2) as u8;
 const PCI_CORBSIZE_SZ_MASK: u8 = bitspan(1, 0) as u8;
@@ -792,6 +795,8 @@ impl<'a> CommandResponseBuffers<'a> {
             return Err(uefi::Status::UNSUPPORTED.into());
         }
 
+        // We don't check of size capabilities an only rely
+        // on the implementation dependent size bits because vbox refuses to return
         let corbszcap = CORBSIZE.read(pci)
             .ignore_warning()?;
         let corbsize = match (corbszcap & PCI_CORBSIZE_SZ_MASK) {
@@ -823,29 +828,45 @@ impl<'a> CommandResponseBuffers<'a> {
             .map_err(|e| {error!("wait CORBCTL.DMA=0: {:?}", e.status()); e})?;
         RIRBCTL.wait(pci, 1000, PCI_RIRBCTL_DMA_BIT, 0)
             .map_err(|e| {error!("wait RIRBCTL.DMA=0: {:?}", e.status()); e})?;
+
+        // Reset the read pointer. Read pointer bits are not
+        // really RO on both qemu and vbox so we must write
+        // 0's.
+        CORBRP.update(pci, PCI_CORBRP_RST_BIT, !PCI_CORBRP_RSVDP_MASK)?;
+        CORBRP.wait(pci, 1000, PCI_CORBRP_RST_BIT, PCI_CORBRP_RST_BIT)
+            .map_err(|error| {
+                error!("wait CORBRP.RST=1: {:?}", error.status());
+                error
+            })?;
+        CORBRP.and(pci, !PCI_CORBRP_RST_BIT)?;
+        CORBRP.wait(pci, 1000, PCI_CORBRP_RST_BIT, 0)
+            .map_err(|error| {
+                error!("wait CORBRP.RST=0: {:?}", error.status());
+                error
+            })?;
+
+        // Reset the write pointer.
+        CORBWP.and(pci, PCI_CORBWP_RSVDP_MASK)?;
+
         // Program the CORB base address
         CORBLBASE.write(pci, (corb.device_address() & 0xffff_ffff) as u32)?;
         CORBUBASE.write(pci, ((corb.device_address() >> 32) & 0xffff_ffff) as u32)?;
         CORBSIZE.update(pci, (corbszcap & PCI_CORBSIZE_SZ_MASK), !PCI_CORBSIZE_RSVDP_MASK)?;
-        // Reset the read pointer
-        CORBRP.or(pci, PCI_CORBRP_RST_BIT)?;
-        CORBRP.wait(pci, 1000, PCI_CORBRP_RST_BIT, PCI_CORBRP_RST_BIT)
-            .map_err(|e| {error!("wait CORBRP.RST=1: {:?}", e.status()); e})?;
-        CORBRP.and(pci, !PCI_CORBRP_RST_BIT)?;
-        CORBRP.wait(pci, 1000, PCI_CORBRP_RST_BIT, 0)
-            .map_err(|e| {error!("wait CORBRP.RST=0: {:?}", e.status()); e})?;
-        // Reset the write pointer
-        CORBWP.update(pci, 0, !PCI_CORBWP_RSVDP_MASK)?;
-        CORBCTL.or(pci, PCI_CORBCTL_DMA_BIT)?;
+
         // Program the RIRB base address
         RIRBLBASE.write(pci, (rirb.device_address() & 0xffff_ffff) as u32)?;
         RIRBUBASE.write(pci, ((rirb.device_address() >> 32) & 0xffff_ffff) as u32)?;
         RIRBSIZE.update(pci, (rirbszcap & PCI_RIRBSIZE_SZ_MASK), !PCI_RIRBSIZE_RSVDP_MASK)?;
+
         // Reset RIRB write pointer
-        RIRBWP.update(pci, PCI_RIRBWP_RST_BIT, !PCI_RIRBWP_RSVDP_MASK)?;
-        // TBD: qemu-2.11 does not process CORB without IRQ bit or with RINTCNT=0
+        RIRBWP.or(pci, PCI_RIRBWP_RST_BIT)?;
+
+        // TBD: qemu does not process CORB without IRQ bit or with RINTCNT=0
         RINTCNT.update(pci, 0x1, !PCI_RINTCNT_RSVDP_MASK)?;
         RIRBCTL.or(pci, PCI_RIRBCTL_DMA_BIT | PCI_RIRBCTL_IRQ_BIT)?;
+
+        // Vbox is pretty sensitive to the order of CORBCTL/RIRBCTL changes.
+        CORBCTL.or(pci, PCI_CORBCTL_DMA_BIT)?;
 
         Ok(CommandResponseBuffers {
             read_pos: 0,
