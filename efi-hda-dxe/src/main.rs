@@ -788,7 +788,7 @@ impl<'a> CommandResponseBuffers<'a> {
             return Err(uefi::Status::UNSUPPORTED.into());
         }
         if (rirb.device_address() & 0b1111111) != 0 {
-            error!("RIRB address {:#x} is not supported", corb.device_address());
+            error!("RIRB address {:#x} is not supported", rirb.device_address());
             return Err(uefi::Status::UNSUPPORTED.into());
         }
 
