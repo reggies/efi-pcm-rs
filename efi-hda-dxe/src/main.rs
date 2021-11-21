@@ -1173,19 +1173,18 @@ fn make_bus_io<'a>(pci: &'a PciIO) -> uefi::Result<CommandResponseBuffers<'a>> {
 
 fn bus_probe_codecs(pci: &PciIO, codec_mask: u16) -> uefi::Result<alloc::vec::Vec<u32>> {
     let mut codecs = alloc::vec::Vec::new();
-    // TBD: use STATESTS/codec_mask instead
-    for codec in &[0, 1, 2, 3] {
+    for codec in (0..16).filter(|n| (codec_mask & (1 << n)) != 0) {
         // Create new command response buffer for each new
         // codec because old one can be broken due to an
         // access to non-existant codec
         let mut bus = make_bus_io(pci).ignore_warning()?;
 
-        let cmd = make_command(Codec(*codec), HDA_NODE_ROOT, HDA_VERB_PARAMS, HDA_PARAM_VID);
+        let cmd = make_command(Codec(codec), HDA_NODE_ROOT, HDA_VERB_PARAMS, HDA_PARAM_VID);
         match bus.exec(cmd).ignore_warning() {
             Ok(vid) => {
                 info!("codec {:#x} is detected, response:{:#x}", codec, vid);
-                if let Ok(..) = codec_trace_config(&mut bus, pci, Codec(*codec)) {
-                    codecs.push(*codec);
+                if let Ok(..) = codec_trace_config(&mut bus, pci, Codec(codec)) {
+                    codecs.push(codec);
                 }
             }
             Err(error) => {
