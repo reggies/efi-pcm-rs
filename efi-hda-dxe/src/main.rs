@@ -462,10 +462,19 @@ struct Descriptor {
     control: u32
 }
 
-// Minimum size is not specified by the minimum alignment is 128 bytes
+// Minimum size is not specified but the minimum alignment
+// is 128 bytes
 const BUFFER_SIZE: usize = 4096;
-// Maximum count is 256 according to the spec
-const BUFFER_COUNT: usize = 32;
+
+// Maximum count is 256 according to the spec. Due to a bug
+// in vbox the maximum buffers is 8 for 44100hz or 4 for
+// 22050hz. The idea for workaround follows. While trying to
+// split the DMA timer intervals the vbox r3vm goes into
+// infinite loop in hdaR3StreamAddScheduleItem() but only if
+// the guest driver supplies more than 200 msec BDL. The
+// number of buffers is choosen to workaround vbox bug while
+// running our test app (which is 44100hz and 22050hz).
+const BUFFER_COUNT: usize = 4;
 
 #[repr(C, align(128))]
 #[derive(Copy, Clone)]
