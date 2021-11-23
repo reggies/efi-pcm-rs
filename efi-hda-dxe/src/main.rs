@@ -1757,37 +1757,38 @@ impl<T: Copy + Clone> NodeMap<T> {
     }
 }
 
-fn hda_find_dac<'a, F: Fn(Node) -> &'a PathNode>(vertices: F, start: Node) -> Option<alloc::vec::Vec<Node>> {
+fn hda_find_dac<'a, F: Fn(Node) -> Option<&'a PathNode>>(vertices: F, start: Node) -> Option<alloc::vec::Vec<Node>> {
     let mut queue = Fifo::new();
     queue.push(start);
     let mut path = NodeMap::<Node>::new();
     while let Some(pivot) = queue.pop() {
-        // TBD: the assumption that for each Node there is a PathNode is wrong.
-        //      e.g. by filtering out unsupported DAC we will
-        //      create some dangling connections
-        let path_node = vertices(pivot);
-        if path_node.is_dac() {
-            let mut result = alloc::vec::Vec::new();
-            let mut pivot = pivot;
-            while let Some(parent) = path.get(pivot) {
+        if let Some(path_node) = vertices(pivot) {
+            if path_node.is_dac() {
+                let mut result = alloc::vec::Vec::new();
+                let mut pivot = pivot;
+                while let Some(parent) = path.get(pivot) {
+                    result.push(pivot);
+                    pivot = parent;
+                }
                 result.push(pivot);
-                pivot = parent;
+                return Some(result);
             }
-            result.push(pivot);
-            return Some(result);
-        }
-        for &succ in path_node.successors() {
-            if !path.contains_key(&succ) {
-                path.insert(&succ, pivot);
-                queue.push(succ);
+            for &succ in path_node.successors() {
+                if !path.contains_key(&succ) {
+                    path.insert(&succ, pivot);
+                    queue.push(succ);
+                }
             }
+        } else {
+            let pred = path.get(pivot).unwrap();
+            warn!("Unhandled dangling connection from {:?} to {:?}", pred, pivot);
         }
     }
     None
 }
 
-fn find_path_connection_index<'a, F: Fn(Node) -> &'a PathNode>(vertices: F, start: Node, next: Node) -> Option<usize> {
-    vertices(start)
+fn find_path_connection_index<'a, F: Fn(Node) -> Option<&'a PathNode>>(vertices: F, start: Node, next: Node) -> Option<usize> {
+    vertices(start)?
         .successors()
         .iter()
         .position(|&node| node == next)
@@ -1826,7 +1827,7 @@ fn codec_setup_stream<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &P
     for path_node in nodes.iter() {
         node_map.insert(&path_node.node(), path_node);
     }
-    let vertices = |node| node_map.get(node).unwrap();
+    let vertices = |node| node_map.get(node);
     let mut active_nodes = NodeMap::new();
     for headphones in [ true, false ] {
         // TBD: how association and sequence can be useful?
