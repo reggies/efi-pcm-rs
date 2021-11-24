@@ -155,10 +155,6 @@ const PCI_INSTRMPAY: u32    = 0x1a; // ro, u16
 const PCI_INTCTL: u32       = 0x20; // rw, u32
 const PCI_INTSTS: u32       = 0x24; // ro, u32
 const PCI_WALCLK: u32       = 0x30; // ro, u32
-const PCI_SSYNC_ICH6: u32   = 0x34; // rw, u32
-const PCI_SSYNC_ICH10: u32  = 0x38; // rw, u32
-// const PCI_SSYNC: u32        = PCI_SSYNC_ICH6;
-const PCI_SSYNC: u32        = PCI_SSYNC_ICH10;
 const PCI_CORBLBASE: u32    = 0x40; // rw, u32
 const PCI_CORBUBASE: u32    = 0x44; // rw, u32
 const PCI_CORBWP: u32       = 0x48; // rw, u16
@@ -272,9 +268,6 @@ const PCI_SDCTL8_STREAM_13_MASK: u8 = 13 << 4;
 const PCI_SDCTL8_STREAM_14_MASK: u8 = 14 << 4;
 const PCI_SDCTL8_STREAM_15_MASK: u8 = 15 << 4;
 
-const PCI_SSYNC_RSVDP_MASK: u32 = BIT30 | BIT31;
-const PCI_SSYNC_STREAM_MASK: u32 = !(PCI_SSYNC_RSVDP_MASK);
-
 const PCI_INTSTS_SIS_MASK: u32 = !(PCI_INTSTS_CIS_BIT | PCI_INTSTS_GIS_BIT);
 const PCI_INTSTS_CIS_BIT: u32 = BIT30;
 const PCI_INTSTS_GIS_BIT: u32 = BIT31;
@@ -362,7 +355,6 @@ const INSTRMPAY: IoBase<u16>    = IoBase::new(PCI_INSTRMPAY);
 const INTCTL: IoBase<u32>       = IoBase::new(PCI_INTCTL);
 const INTSTS: IoBase<u32>       = IoBase::new(PCI_INTSTS);
 const WALCLK: IoBase<u32>       = IoBase::new(PCI_WALCLK);
-const SSYNC: IoBase<u32>        = IoBase::new(PCI_SSYNC);
 const CORBLBASE: IoBase<u32>    = IoBase::new(PCI_CORBLBASE);
 const CORBUBASE: IoBase<u32>    = IoBase::new(PCI_CORBUBASE);
 const CORBWP: IoBase<u16>       = IoBase::new(PCI_CORBWP);
@@ -434,10 +426,6 @@ impl StreamRegisterSet {
     }
 
     fn intctl_mask(&self) -> u32 {
-        1 << self.index
-    }
-
-    fn ssync_mask(&self) -> u32 {
         1 << self.index
     }
 }
@@ -593,9 +581,8 @@ fn bus_trace_registers(pci: &PciIO) -> uefi::Result {
     let gctl = GCTL.read(pci).ignore_warning()?;
     let statests = STATESTS.read(pci).ignore_warning()?;
     let intsts = INTSTS.read(pci).ignore_warning()?;
-    let ssync = SSYNC.read(pci).ignore_warning()?;
-    info!("GCTL:{:#010x} STATESTS:{:#010x} INTSTS:{:#010x} SSYNC:{:#010x}",
-          gctl, statests, intsts, ssync);
+    info!("GCTL:{:#010x} STATESTS:{:#010x} INTSTS:{:#010x}",
+          gctl, statests, intsts);
     uefi::Status::SUCCESS.into()
 }
 
@@ -1323,17 +1310,16 @@ struct NodeDescriptor {
     count: u32
 }
 
-fn parse_node_count(response: u32) -> uefi::Result<NodeDescriptor> {
+fn parse_node_count(response: u32) -> NodeDescriptor {
     let start_id = (response >> 16) & 0x7fff;
     let count = response & 0x7fff;
-    Ok(NodeDescriptor { start_id, count }.into())
+    NodeDescriptor { start_id, count }
 }
 
 fn find_audio_function_node<B: BusIo>(bus: &mut B, pci: &PciIO, codec: Codec) -> uefi::Result<Node> {
     let NodeDescriptor {start_id, count} = bus.exec(make_command(codec, HDA_NODE_ROOT, HDA_VERB_PARAMS, HDA_PARAM_NODE_COUNT))
         .ignore_warning()
-        .and_then(parse_node_count)
-        .ignore_warning()?;
+        .map(parse_node_count)?;
     info!("sub nodes: {} nodes starting from {}", start_id, count);
     let mut afg = None;
     for n in start_id..(start_id + count) {
@@ -1357,7 +1343,6 @@ fn pin_mute_unmute<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &PciI
     info!("pin_mute_unmute: {:?} {}", node, mute);
     let amc = bus.exec(make_command(codec, node, HDA_VERB_PARAMS, HDA_PARAM_AMPLIFIER_OUTPUT_CAPABILITY))
         .ignore_warning()?;
-    let num_steps = (amc & HDA_AMPLIFIER_CAPABILITY_NUMSTEPS_MASK) >> 8;
     let offset = amc & HDA_AMPLIFIER_CAPABILITY_OFFSET_MASK;
     if amc & HDA_AMPLIFIER_CAPABILITY_MUTE_BIT != 0 {
         let mut flags = HDA_AMPLIFIER_GAIN_MUTE_SETO_BIT
@@ -1399,8 +1384,7 @@ fn codec_trace_config<B: BusIo>(bus: &mut B, pci: &PciIO, codec: Codec) -> uefi:
         .ignore_warning()?;
     let NodeDescriptor {start_id, count} = bus.exec(make_command(codec, afg, HDA_VERB_PARAMS, HDA_PARAM_NODE_COUNT))
         .ignore_warning()
-        .and_then(parse_node_count)
-        .ignore_warning()?;
+        .map(parse_node_count)?;
     info!("AFG {:?} has {} sub nodes starting with {}", afg, count, start_id);
     info!("AFG power state is {:#x} (supported {:#x})", ps_current, ps_supported);
     for n in start_id..(start_id + count) {
@@ -1626,8 +1610,7 @@ fn codec_collect_nodes<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &
         .ignore_warning()?;
     let NodeDescriptor { start_id, count } = bus.exec(make_command(codec, afg, HDA_VERB_PARAMS, HDA_PARAM_NODE_COUNT))
         .ignore_warning()
-        .and_then(parse_node_count)
-        .ignore_warning()?;
+        .map(parse_node_count)?;
     info!("sub nodes: {} nodes starting from {}", start_id, count);
     let mut result = alloc::vec::Vec::with_capacity(count as usize);
     for n in start_id..(start_id + count) {
@@ -1809,8 +1792,7 @@ fn codec_setup_stream<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &P
         .ignore_warning()?;
     let NodeDescriptor { start_id, count } = bus.exec(make_command(codec, afg, HDA_VERB_PARAMS, HDA_PARAM_NODE_COUNT))
         .ignore_warning()
-        .and_then(parse_node_count)
-        .ignore_warning()?;
+        .map(parse_node_count)?;
     info!("sub nodes: {} nodes starting from {}", start_id, count);
     pin_power(bus, device, pci, codec, afg, true)?;
     // As preparation we power-up all widgets and accomplish
@@ -1863,7 +1845,6 @@ fn codec_setup_stream<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &P
                         }
                     }
                     // Mark all just found nodes as active
-                    // active_nodes.append(&mut path);
                     for node in path.iter() {
                         active_nodes.insert(node, true);
                     }
@@ -2001,31 +1982,6 @@ fn stream_start(device: &mut DeviceContext, pci: &PciIO) -> uefi::Result {
     out_stream_1(device)
         .ctl16()
         .or(pci, PCI_SDCTL16_RUN_BIT | PCI_SDCTL16_INT_MASK)?;
-    uefi::Status::SUCCESS.into()
-}
-
-fn stream_stop(device: &mut DeviceContext, pci: &PciIO) -> uefi::Result {
-    stream_clear(device, pci)?;
-    // disable SIE; we don't use interrupts atm
-    INTCTL.and(pci, !out_stream_1(device).intctl_mask())?;
-    uefi::Status::SUCCESS.into()
-}
-
-fn stream_sync_get(device: &mut DeviceContext, pci: &PciIO) -> uefi::Result {
-    // TBD: SSYNC is ignored in qemu and meaningless for a
-    // single stream
-    SSYNC.or(pci, out_stream_1(device).ssync_mask())?;
-    uefi::Status::SUCCESS.into()
-}
-
-fn stream_sync_put(device: &mut DeviceContext, pci: &PciIO) -> uefi::Result {
-    // TBD: SSYNC is ignored in qemu and meaningless for a
-    // single stream
-    SSYNC.and(pci, !out_stream_1(device).ssync_mask())?;
-    uefi::Status::SUCCESS.into()
-}
-
-fn stream_wait_sync_start(device: &mut DeviceContext, pci: &PciIO) -> uefi::Result {
     // TBD: a better way to check that FIFO is ready? prefill up to FIFOS bytes?
     // "For an Output stream, the controller hardware will
     // set this bit to a 1 while the output DMA FIFO
@@ -2041,7 +1997,10 @@ fn stream_wait_sync_start(device: &mut DeviceContext, pci: &PciIO) -> uefi::Resu
     uefi::Status::SUCCESS.into()
 }
 
-fn stream_wait_sync_stop(device: &mut DeviceContext, pci: &PciIO) -> uefi::Result {
+fn stream_stop(device: &mut DeviceContext, pci: &PciIO) -> uefi::Result {
+    stream_clear(device, pci)?;
+    // disable SIE; we don't use interrupts atm
+    INTCTL.and(pci, !out_stream_1(device).intctl_mask())?;
     out_stream_1(device)
         .ctl16()
         .wait(pci, 1000, PCI_SDCTL16_RUN_BIT, 0)?;
@@ -2074,10 +2033,7 @@ where C: DmaControl {
         .set_timer(
             *trace_event,
             uefi::table::boot::TimerTrigger::Periodic(delay))?;
-    stream_sync_get(device, pci);
     stream_start(device, pci);
-    stream_wait_sync_start(device, pci);
-    stream_sync_put(device, pci);
     let mut start_lpib = out_stream_1(device)
         .lpib()
         .read(pci)
@@ -2090,7 +2046,6 @@ where C: DmaControl {
                 .lpib()
                 .read(pci)
                 .ignore_warning()?;
-            // info!("actual_lpib = {}, start_lpib = {}", actual_lpib, start_lpib);
             let room = if start_lpib <= actual_lpib {
                 queue_room
                     + actual_lpib as usize / mem::size_of::<i16>()
@@ -2119,10 +2074,7 @@ where C: DmaControl {
         }
         info!("stopping stream");
     }
-    stream_sync_get(device, pci);
     stream_stop(device, pci);
-    stream_wait_sync_stop(device, pci);
-    stream_sync_put(device, pci);
 
     info!("clearning stream");
     stream_clear(device, pci);
@@ -2194,7 +2146,6 @@ impl<'a> DmaControl for Loop<'a> {
         let mut count = count;
         let mut total = 0;
         while count > 0 {
-            // info!(" transfer iteration: count = {}, bdl = {}, samples = {}", count, self.bdl_position, self.samples_position);
             let CopyResult {loop_buffers, loop_samples} =
                 fill_bde(
                     &mut self.bdl.buffers[self.bdl_position],
@@ -2202,7 +2153,6 @@ impl<'a> DmaControl for Loop<'a> {
                     self.samples_position,
                     self.samples
                 );
-            // info!("  transfer result: loop_samples = {}, loop_buffers = {}", loop_samples, loop_buffers);
             self.samples_position = (self.samples_position + loop_samples) % self.samples.len();
             self.bdl_position = (self.bdl_position + loop_buffers) % BUFFER_COUNT;
             count -= loop_samples;
@@ -2416,10 +2366,6 @@ fn init_context(driver_handle: Handle, controller_handle: Handle, pci: &PciIO, c
     Ok (device.into())
 }
 
-fn deinit_context(pci: &PciIO) -> uefi::Result {
-    Ok(().into())
-}
-
 #[derive(Copy, Clone)]
 struct CopyResult {
     loop_buffers: usize,
@@ -2446,36 +2392,6 @@ fn fill_bde(buffer: &mut SampleBuffer, descriptor: &mut Descriptor, samples_posi
         loop_buffers: 1,
         loop_samples: buffer.samples.len()
     }
-}
-
-fn copy_samples_to_buffer(bdl: &mut BufferDescriptorListWithBuffers, index: usize, samples: &[i16]) -> CopyResult {
-    let mut buffer_offset = 0;
-    let mut buffer_count = 0;
-    for (descriptor, buffer) in bdl.descriptors.iter_mut().zip(bdl.buffers.iter_mut()).skip(index) {
-        let count = (samples.len() - buffer_offset).min(buffer.samples.len());
-        &mut buffer.samples[0..count]
-            .copy_from_slice(&samples[buffer_offset..buffer_offset+count]);
-        // info!("copy_samples_to_buffer: schedule {} samples starting at {}", count, buffer_offset);
-        if count > 0 {
-            buffer_offset += count as usize;
-            descriptor.length = count as u32 * mem::size_of::<i16>() as u32;
-            descriptor.control = 0;
-            buffer_count += 1;
-        } else {
-            descriptor.length = 0;
-            descriptor.control = 0;
-            // TBD: not ignored on qemu ich9-intel-hda
-            // descriptor.control = BDBAR_IOC_BIT;
-        }
-    }
-    CopyResult {
-        loop_buffers: buffer_count,
-        loop_samples: buffer_offset
-    }
-}
-
-fn div_round_up(a: usize, b: usize) -> usize {
-    (a + b - 1) / b
 }
 
 fn square(phase: usize, period: usize) -> i16 {
@@ -2739,20 +2655,6 @@ fn hda_stop_child(this: &DriverBinding, controller: Handle, child: Handle) -> ue
     let audio_out = unsafe { audio_out                     // OpenProtocol<'boot>
                              .as_ref()                     // Option<&SimpleAudioOut>
                              .unwrap() };
-    {
-        // SAFETY: safe as long as no other references exist in our code
-        let pci = unsafe { pci                           // OpenProtocol<'boot>
-                           .as_proto()                   // &'boot UnsafeCell<PciIO>
-                           .get()                        // *PciIO
-                           .as_ref()                     // Option<&PciIO>
-                           .unwrap() };
-        deinit_context(pci)
-            .map_err(|error| {
-                warn!("Failed to deinitialize audio codec: {:?}", error.status());
-                error
-            })
-            .or(uefi::Status::SUCCESS.into())?;                                       // ignore error
-    }
     if let Err(status) = pci.close() {
         warn!("failed to close PCI I/O: {:?}", status);
     }
