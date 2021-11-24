@@ -10,6 +10,10 @@ panic = "abort"
 [profile.release]
 panic = "abort"
 
+[features]
+log_stderr = []
+log_serial = []
+
 [dependencies]
 uefi = { git = "ssh://git@github.com/reggies/uefi-rs", features = ['exts', 'logger', 'alloc'] }
 uefi-macros = { git = "ssh://git@github.com/reggies/uefi-rs" }

@@ -17,32 +17,52 @@ mod serial;
 mod stderr;
 
 static mut SYSTEM_TABLE: Option<uefi::table::SystemTable<uefi::table::Boot>> = None;
-static mut LOGGER: Option<stderr::Logger> = None;
-// static mut SERIAL_LOGGER: Option<serial::Logger> = None;
 
-// unsafe fn init_serial_logger(st: &uefi::table::SystemTable<uefi::table::Boot>) -> () {
-//     st.boot_services()
-//         .locate_protocol::<uefi::proto::console::serial::Serial>()
-//         .warning_as_error()
-//         .ok()
-//         .map(|serial| {
-//             let logger = {
-//                 SERIAL_LOGGER = Some(serial::Logger::new(&mut *serial.get()));
-//                 SERIAL_LOGGER.as_ref().unwrap()
-//             };
-//             log::set_logger(logger).unwrap();
-//             log::set_max_level(log::LevelFilter::Info);
-//         });
-// }
+#[cfg(all(feature = "log_serial", feature = "log_stderr"))]
+compile_error!("Features log_serial and log_stderr are mutually exclusive");
 
-unsafe fn init_logger(st: &'static uefi::table::SystemTable<uefi::table::Boot>) -> () {
-    let logger = {
-        LOGGER = Some(stderr::Logger::new(st));
-        LOGGER.as_ref().unwrap()
-    };
+#[cfg(all(feature = "log_serial", not(feature = "log_stderr")))]
+mod details {
+    use super::*;
 
-    log::set_logger(logger).unwrap();
-    log::set_max_level(log::LevelFilter::Info);
+    static mut LOGGER: Option<serial::Logger> = None;
+
+    pub unsafe fn init_logger(st: &uefi::table::SystemTable<uefi::table::Boot>) {
+        st.boot_services()
+            .locate_protocol::<uefi::proto::console::serial::Serial>()
+            .warning_as_error()
+            .ok()
+            .map(|serial| {
+                let logger = {
+                    LOGGER = Some(serial::Logger::new(&mut *serial.get()));
+                    LOGGER.as_ref().unwrap()
+                };
+                log::set_logger(logger).unwrap();
+                log::set_max_level(log::LevelFilter::Info);
+            });
+    }
+}
+
+#[cfg(all(feature = "log_stderr", not(feature = "log_serial")))]
+mod details {
+    use super::*;
+
+    static mut LOGGER: Option<stderr::Logger> = None;
+
+    pub unsafe fn init_logger(st: &'static uefi::table::SystemTable<uefi::table::Boot>) {
+        let logger = {
+            LOGGER = Some(stderr::Logger::new(st));
+            LOGGER.as_ref().unwrap()
+        };
+
+        log::set_logger(logger).unwrap();
+        log::set_max_level(log::LevelFilter::Info);
+    }
+}
+
+#[cfg(all(not(feature = "log_serial"), not(feature = "log_stderr")))]
+mod details {
+    pub unsafe fn init_logger(st: &'static uefi::table::SystemTable<uefi::table::Boot>) {}
 }
 
 // fn exit_boot_services(_e: uefi::Event) {
@@ -56,7 +76,7 @@ pub fn boot_services() -> &'static uefi::table::boot::BootServices {
 pub fn init(_handle: uefi::Handle, system_table: &SystemTable<Boot>) -> uefi::Result {
     unsafe {
         SYSTEM_TABLE = Some(system_table.unsafe_clone());
-        init_logger(SYSTEM_TABLE.as_ref().unwrap());
+        details::init_logger(SYSTEM_TABLE.as_ref().unwrap());
         uefi::alloc::init(system_table.boot_services());
         // TBD: the event handle must be closed when
         //  - DriverEntry() returns an error
