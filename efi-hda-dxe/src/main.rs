@@ -1237,13 +1237,32 @@ fn pin_enable_eapd<B: BusIo>(bus: &mut B, codec: Codec, node: Node, enable: bool
         let mut eapd = bus.exec(make_command(codec, node, HDA_VERB_GET_EAPDBTL_ENABLE, Param(0x0)))
             .ignore_warning()?;
         if enable {
-            info!("pin_enable_eapd: {:?} enable EAPD/BTL (current {:#x})", node, eapd);
-            eapd |= HDA_PIN_EAPDBTL_EAPD_ENABLE_BIT | HDA_PIN_EAPDBTL_BTL_ENABLE_BIT;
+            info!("pin_enable_eapd: {:?} enable EAPD (current {:#x})", node, eapd);
+            eapd |= HDA_PIN_EAPDBTL_EAPD_ENABLE_BIT;
         } else {
-            info!("pin_enable_eapd: {:?} disable EAPD/BTL (current {:#x})", node, eapd);
-            eapd &= !(HDA_PIN_EAPDBTL_EAPD_ENABLE_BIT | HDA_PIN_EAPDBTL_BTL_ENABLE_BIT);
+            info!("pin_enable_eapd: {:?} disable EAPD (current {:#x})", node, eapd);
+            eapd &= !HDA_PIN_EAPDBTL_EAPD_ENABLE_BIT;
         }
         bus.exec(make_command(codec, node, HDA_VERB_SET_EAPDBTL_ENABLE, Param(eapd)))?;
+    }
+    uefi::Status::SUCCESS.into()
+}
+
+fn pin_enable_btl<B: BusIo>(bus: &mut B, codec: Codec, node: Node, enable: bool) -> uefi::Result {
+    let caps = bus.exec(make_command(codec, node, HDA_VERB_PARAMS, HDA_PARAM_PIN_WIDGET_CAPABILITIES))
+        .ignore_warning()
+        .map(PinCapabilities::from)?;
+    if caps.balanced_io_pins() {
+        let mut btl = bus.exec(make_command(codec, node, HDA_VERB_GET_EAPDBTL_ENABLE, Param(0x0)))
+            .ignore_warning()?;
+        if enable {
+            info!("pin_enable_btl: {:?} enable BTL (current {:#x})", node, btl);
+            btl |= HDA_PIN_EAPDBTL_BTL_ENABLE_BIT;
+        } else {
+            info!("pin_enable_btl: {:?} disable EAPD (current {:#x})", node, btl);
+            btl &= !HDA_PIN_EAPDBTL_BTL_ENABLE_BIT;
+        }
+        bus.exec(make_command(codec, node, HDA_VERB_SET_EAPDBTL_ENABLE, Param(btl)))?;
     }
     uefi::Status::SUCCESS.into()
 }
@@ -1787,6 +1806,7 @@ fn codec_setup_stream<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &P
                         if path.contains(&path_node.node()) {
                             pin_mute_unmute(bus, codec, Some(&afg_amp_caps), path_node.node(), false)?;
                             pin_enable_eapd(bus, codec, path_node.node(), true)?;
+                            pin_enable_btl(bus, codec, path_node.node(), true)?;
                             if let Some(next_node) = get_path_next_node(&path, path_node.node()) {
                                 if let Some(index) = find_path_connection_index(vertices, path_node.node(), next_node) {
                                     // Note that it is not possible to override previous pin selection
