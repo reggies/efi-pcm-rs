@@ -2037,9 +2037,6 @@ where C: DmaControl {
     }
     stream_stop(device, pci);
 
-    info!("clearning stream");
-    stream_clear(device, pci);
-
     uefi::Status::SUCCESS.into()
 }
 
