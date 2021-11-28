@@ -2365,8 +2365,12 @@ extern "efiapi" fn hda_supported(this: &DriverBinding, handle: Handle, remaining
         .ignore_warning()?;
     let device_id = pci.read_config_single::<u16>(PCI_DID)
         .ignore_warning()?;
+    let class_id = pci.read_config_single::<u8>(PCI_SCC)
+        .ignore_warning()?;
+    let subclass_id = pci.read_config_single::<u8>(PCI_BCC)
+        .ignore_warning()?;
     info!("vendor: {:#x}, device: {:#x}", vendor_id, device_id);
-    // TBD: check class (4h) and subclass (3h)
+    info!("class: {:#x}, subclass: {:#x}", class_id, subclass_id);
     let supported = {
         [
             (VID_INTEL, HDA_ICH6), // ICH6
@@ -2376,7 +2380,9 @@ extern "efiapi" fn hda_supported(this: &DriverBinding, handle: Handle, remaining
         ].iter().any(|&(vid, did)| {
             vendor_id == vid && device_id == did
         })
-    };
+    } || (class_id == 0x4                                // HDA
+          && subclass_id == 0x3                          // multimedia
+    );
     if !supported {
         return uefi::Status::UNSUPPORTED;
     }
