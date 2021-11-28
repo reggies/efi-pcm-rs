@@ -66,6 +66,8 @@ use efi_dxe::*;
 use efi_pcm::*;
 mod device_path;
 mod driver_binding;
+mod hda;
+use hda::*;
 
 mod iobase;
 use iobase::*;
@@ -431,7 +433,7 @@ impl StreamRegisterSet {
 }
 
 fn out_stream(gcap: &GlobalCapabilities, index: usize) -> StreamRegisterSet {
-    StreamRegisterSet::new(u32::from(gcap.in_streams) + index as u32)
+    StreamRegisterSet::new(u32::from(gcap.in_streams()) + index as u32)
 }
 
 fn in_stream(gcap: &GlobalCapabilities, index: usize) -> StreamRegisterSet {
@@ -590,12 +592,12 @@ fn bus_clear_interrupt(pci: &PciIO) -> uefi::Result {
     let gcap = GCAP.read(pci)
         .ignore_warning()
         .map(GlobalCapabilities::from)?;
-    for stream in 0..gcap.in_streams {
+    for stream in 0..gcap.in_streams() {
         in_stream(&gcap, stream as usize)
             .sts()
             .write(pci, PCI_SDSTS_INT_MASK)?;
     }
-    for stream in 0..gcap.out_streams {
+    for stream in 0..gcap.out_streams() {
         out_stream(&gcap, stream as usize)
             .sts()
             .write(pci, PCI_SDSTS_INT_MASK)?;
@@ -606,36 +608,11 @@ fn bus_clear_interrupt(pci: &PciIO) -> uefi::Result {
     uefi::Status::SUCCESS.into()
 }
 
-struct GlobalCapabilities {
-    out_streams: u16,
-    in_streams: u16,
-    bd_streams: u16,
-    sdo_signals: u16,
-    ok_64: bool,
-}
-
-impl GlobalCapabilities {
-    fn from(gcap: u16) -> GlobalCapabilities {
-        GlobalCapabilities {
-            out_streams: (gcap >> 12) & 0b1111,
-            in_streams: (gcap >> 8) & 0b1111,
-            bd_streams: (gcap >> 3) & 0b11111,
-            sdo_signals: (gcap >> 1) & 0b11,
-            ok_64: (u32::from(gcap) & BIT0) == BIT0
-        }
-    }
-}
-
 fn bus_trace_config(pci: &PciIO) -> uefi::Result {
     let gcap = GCAP.read(pci)
         .ignore_warning()
         .map(GlobalCapabilities::from)?;
-    info!("HDA controller Global Capabilities:");
-    info!("  OSS:{}", gcap.out_streams);
-    info!("  ISS:{}", gcap.in_streams);
-    info!("  BID:{}", gcap.bd_streams);
-    info!("  SDO:{}", gcap.sdo_signals);
-    info!("  64k:{}", gcap.ok_64);
+    info!("HDA controller Global Capabilities: {:#?}", gcap);
     uefi::Status::SUCCESS.into()
 }
 
@@ -661,12 +638,12 @@ fn bus_stop(pci: &PciIO) -> uefi::Result {
     // disabling interrupts for each stream descriptors is
     // only necessary when we taking ownership of the bus
     // link
-    for stream in 0..gcap.in_streams {
+    for stream in 0..gcap.in_streams() {
         in_stream(&gcap, stream as usize)
             .ctl16()
             .and(pci, !PCI_SDCTL16_INT_MASK)?;
     }
-    for stream in 0..gcap.out_streams {
+    for stream in 0..gcap.out_streams() {
         out_stream(&gcap, stream as usize)
             .ctl16()
             .and(pci, !PCI_SDCTL16_INT_MASK)?;
@@ -1052,15 +1029,19 @@ const HDA_VERB_SET_CONNECTION_SELECT: Verb = Verb(0x701);
 const HDA_VERB_GET_PIN_SENSE: Verb = Verb(0xf09);
 const HDA_VERB_EXECUTE_PIN_SENSE: Verb = Verb(0x709);
 
+const HDA_VERB_SET_VOLUME_KNOB: Verb = Verb(0x70f);
+const HDA_VERB_GET_VOLUME_KNOB: Verb = Verb(0xf0f);
+
 const HDA_PARAM_VID: Param = Param(0x0);
 const HDA_PARAM_NODE_COUNT: Param = Param(0x4);
-const HDA_PARAM_AUDIO_WIDGET_CAPABILITIES: Param = Param(0x9);
 const HDA_PARAM_FUNCTION_TYPE: Param = Param(0x5);
-const HDA_PARAM_PIN_WIDGET_CAPABILITIES: Param = Param(0xc);
-const HDA_PARAM_CONNECTION_LIST_LENGTH: Param = Param(0xe);
-const HDA_PARAM_AMPLIFIER_OUTPUT_CAPABILITY: Param = Param(0x12);
-const HDA_PARAM_SUPPORTED_POWER_STATES: Param = Param(0xf);
+const HDA_PARAM_AUDIO_WIDGET_CAPABILITIES: Param = Param(0x9);
 const HDA_PARAM_SUPPORTED_PCM: Param = Param(0xa);
+const HDA_PARAM_PIN_WIDGET_CAPABILITIES: Param = Param(0xc);
+const HDA_PARAM_AMPLIFIER_INPUT_CAPABILITY: Param = Param(0xd);
+const HDA_PARAM_CONNECTION_LIST_LENGTH: Param = Param(0xe);
+const HDA_PARAM_SUPPORTED_POWER_STATES: Param = Param(0xf);
+const HDA_PARAM_AMPLIFIER_OUTPUT_CAPABILITY: Param = Param(0x12);
 const HDA_PARAM_VOLUME_KNOB_CAPABILITIES: Param = Param(0x13);
 
 const HDA_FUNCTION_TYPE_MASK: u32 = BIT7-1;
@@ -1085,11 +1066,15 @@ const HDA_AUDIO_CAPABILITY_CHAN_COUNT_EXT_MASK: u32 = BIT13 | BIT14 | BIT15;
 const HDA_AUDIO_CAPABILITY_DELAY_MASK: u32 = BIT16 | BIT17 | BIT18 | BIT19;
 const HDA_AUDIO_CAPABILITY_TYPE_MASK: u32 = BIT20 | BIT21 | BIT22 | BIT23;
 
+const HDA_SET_VOLUME_KNOB_DIRECT_BIT: u32 = BIT7;
+const HDA_SET_VOLUME_KNOB_VOLUME_MASK: u32 = bitspan(6, 0) as u32;
+
 const HDA_PIN_SENSE_PRESENCE_DETECT: u32 = BIT31;
 
 const HDA_PIN_CAPABILITY_EAPDBTL_BIT: u32 = BIT16;
 const HDA_PIN_EAPDBTL_EAPD_ENABLE_BIT: u32 = BIT1;
 const HDA_PIN_EAPDBTL_BTL_ENABLE_BIT: u32 = BIT0;
+const HDA_PIN_WIDGET_CONTROL_PHN_ENABLE_BIT: u32 = BIT7;
 const HDA_PIN_WIDGET_CONTROL_OUT_ENABLE_BIT: u32 = BIT6;
 const HDA_PIN_WIDGET_CONTROL_IN_ENABLE_BIT: u32 = BIT5;
 
@@ -1105,6 +1090,11 @@ const HDA_AMPLIFIER_GAIN_MUTE_SETR_BIT: u32 = BIT12;
 const HDA_AMPLIFIER_GAIN_MUTE_SETL_BIT: u32 = BIT13;
 const HDA_AMPLIFIER_GAIN_MUTE_SETI_BIT: u32 = BIT14;
 const HDA_AMPLIFIER_GAIN_MUTE_SETO_BIT: u32 = BIT15;
+
+// 7.3.3.7 Amplifier Gain/Mute
+const HDA_AMPLIFIER_GAIN_MUTE_GET_OUT_BIT: u32 = BIT15;
+const HDA_AMPLIFIER_GAIN_MUTE_GET_LEFT_BIT: u32 = BIT13;
+const HDA_AMPLIFIER_GAIN_MUTE_GET_INDEX_MASK: u32 = bitspan(3, 0) as u32;
 
 const HDA_FUNCTION_AUDIO: u32 = 0x1;
 const HDA_FUNCTION_MODEM: u32 = 0x2;
@@ -1228,7 +1218,7 @@ fn stream_trace(device: &mut DeviceContext, pci: &PciIO) -> uefi::Result {
     uefi::Status::SUCCESS.into()
 }
 
-fn codec_set_stream<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &PciIO, codec: Codec, node: Node, mask: u8) -> uefi::Result {
+fn codec_set_stream<B: BusIo>(bus: &mut B, codec: Codec, node: Node, mask: u8) -> uefi::Result {
     let stream_id = bus.exec(make_command(codec, node, HDA_VERB_GET_CHANNEL_STREAM, Param(0x0)))
         .ignore_warning()?;
     info!("codec_set_stream: {:?} read: {:#x}", node, stream_id);
@@ -1239,24 +1229,26 @@ fn codec_set_stream<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &Pci
     uefi::Status::SUCCESS.into()
 }
 
-fn pin_enable_eapd<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &PciIO, codec: Codec, node: Node, enable: bool) -> uefi::Result {
+fn pin_enable_eapd<B: BusIo>(bus: &mut B, codec: Codec, node: Node, enable: bool) -> uefi::Result {
     let caps = bus.exec(make_command(codec, node, HDA_VERB_PARAMS, HDA_PARAM_PIN_WIDGET_CAPABILITIES))
-        .ignore_warning()?;
-    if (caps & HDA_PIN_CAPABILITY_EAPDBTL_BIT) != 0 {
-        let eapd = bus.exec(make_command(codec, node, HDA_VERB_GET_EAPDBTL_ENABLE, Param(0x0)))
+        .ignore_warning()
+        .map(PinCapabilities::from)?;
+    if caps.eapd_capable() {
+        let mut eapd = bus.exec(make_command(codec, node, HDA_VERB_GET_EAPDBTL_ENABLE, Param(0x0)))
             .ignore_warning()?;
         if enable {
             info!("pin_enable_eapd: {:?} enable EAPD/BTL (current {:#x})", node, eapd);
-            bus.exec(make_command(codec, node, HDA_VERB_SET_EAPDBTL_ENABLE, Param(eapd | (HDA_PIN_EAPDBTL_EAPD_ENABLE_BIT | HDA_PIN_EAPDBTL_BTL_ENABLE_BIT))))?;
+            eapd |= HDA_PIN_EAPDBTL_EAPD_ENABLE_BIT | HDA_PIN_EAPDBTL_BTL_ENABLE_BIT;
         } else {
             info!("pin_enable_eapd: {:?} disable EAPD/BTL (current {:#x})", node, eapd);
-            bus.exec(make_command(codec, node, HDA_VERB_SET_EAPDBTL_ENABLE, Param(eapd & !(HDA_PIN_EAPDBTL_EAPD_ENABLE_BIT | HDA_PIN_EAPDBTL_BTL_ENABLE_BIT))))?;
+            eapd &= !(HDA_PIN_EAPDBTL_EAPD_ENABLE_BIT | HDA_PIN_EAPDBTL_BTL_ENABLE_BIT);
         }
+        bus.exec(make_command(codec, node, HDA_VERB_SET_EAPDBTL_ENABLE, Param(eapd)))?;
     }
     uefi::Status::SUCCESS.into()
 }
 
-fn pin_enable_output<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &PciIO, codec: Codec, node: Node, enable: bool) -> uefi::Result {
+fn pin_enable_output<B: BusIo>(bus: &mut B, codec: Codec, node: Node, enable: bool) -> uefi::Result {
     let ctl = bus.exec(make_command(codec, node, HDA_VERB_GET_PIN_WIDGET_CONTROL, Param(0x0)))
         .ignore_warning()?;
     info!("pin_enable_output: {:?} enable: {}, ctl: {:#x}", node, enable, ctl);
@@ -1273,7 +1265,7 @@ fn pin_enable_output<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &Pc
     uefi::Status::SUCCESS.into()
 }
 
-fn pin_power<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &PciIO, codec: Codec, node: Node, up: bool) -> uefi::Result {
+fn pin_power<B: BusIo>(bus: &mut B, codec: Codec, node: Node, up: bool) -> uefi::Result {
     let power_state = bus.exec(make_command(codec, node, HDA_VERB_GET_POWER_STATE, Param(0x0)))
         .ignore_warning()?;
     info!("pin_power: {:?} up: {}, current: {:#x}", node, up, power_state);
@@ -1291,38 +1283,6 @@ fn pin_power<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &PciIO, cod
         return uefi::Status::DEVICE_ERROR.into();
     }
     uefi::Status::SUCCESS.into()
-}
-
-
-struct AmpCapabilities(u32);
-
-impl fmt::Debug for AmpCapabilities {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AmpCapabilities")
-            .field("offset", &self.offset())
-            .field("num_steps", &self.num_steps())
-            .field("step_size", &self.step_size())
-            .field("mute", &self.mute())
-            .finish()
-    }
-}
-
-impl AmpCapabilities {
-    pub fn from(caps: u32) -> AmpCapabilities {
-        AmpCapabilities(caps)
-    }
-    pub fn offset(&self) -> u32 {
-        self.0 & 0x7f
-    }
-    pub fn num_steps(&self) -> u32 {
-        (self.0 >> 8) & 0x7f
-    }
-    pub fn step_size(&self) -> u32 {
-        (self.0 >> 16) & 0x7f
-    }
-    pub fn mute(&self) -> bool {
-        (self.0 >> 31) & 1 == 1
-    }
 }
 
 #[derive(Debug)]
@@ -1387,7 +1347,34 @@ fn pin_mute_unmute<B: BusIo>(bus: &mut B, codec: Codec, afg_caps: Option<&AmpCap
     Ok(().into())
 }
 
-fn codec_set_format<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &PciIO, codec: Codec, node: Node, format: u16) -> uefi::Result {
+fn pin_set_volume<B: BusIo>(bus: &mut B, codec: Codec, node: Node) -> uefi::Result {
+    let volume = bus.exec(make_command(codec, node, HDA_VERB_GET_VOLUME_KNOB, Param(0x0)))
+        .ignore_warning()?;
+    info!("pin_set_volume: {:?} current: {:#x}", node, volume);
+    let flags = HDA_SET_VOLUME_KNOB_DIRECT_BIT | HDA_SET_VOLUME_KNOB_VOLUME_MASK;
+    bus.exec(make_command(codec, node, HDA_VERB_SET_VOLUME_KNOB, Param(flags)))?;
+    let readback = bus.exec(make_command(codec, node, HDA_VERB_GET_VOLUME_KNOB, Param(0x0)))
+        .ignore_warning()?;
+    info!("pin_set_volume: -- readback: {}", readback);
+    Ok(().into())
+}
+
+fn pin_select<B: BusIo>(bus: &mut B, codec: Codec, node: Node, index: usize) -> uefi::Result {
+    let len = bus.exec(make_command(codec, node, HDA_VERB_PARAMS, HDA_PARAM_CONNECTION_LIST_LENGTH))
+        .ignore_warning()?;
+    let select = bus.exec(make_command(codec, node, HDA_VERB_GET_CONNECTION_SELECT, Param(0x0)))
+        .ignore_warning()?;
+    info!("pin_select: {:?} is changing connection select from {} to {}", node, select, index);
+    if index < len as usize {
+        bus.exec(make_command(codec, node, HDA_VERB_SET_CONNECTION_SELECT, Param(index as u32)))?;
+        let select = bus.exec(make_command(codec, node, HDA_VERB_GET_CONNECTION_SELECT, Param(0x0)))
+            .ignore_warning()?;
+        info!("pin_select: -- readback: {}", select);
+    }
+    Ok(().into())
+}
+
+fn codec_set_format<B: BusIo>(bus: &mut B, codec: Codec, node: Node, format: u16) -> uefi::Result {
     info!("codec_set_format: {:?} format: {:#x}", node, format);
     bus.exec(make_command(codec, node, HDA_VERB_SET_STREAM_FORMAT, Param(u32::from(format))))?;
     let readback = bus.exec(make_command(codec, node, HDA_VERB_GET_STREAM_FORMAT, Param(0x0)))
@@ -1431,79 +1418,71 @@ fn find_audio_function_node<B: BusIo>(bus: &mut B, pci: &PciIO, codec: Codec) ->
     Ok(afg.unwrap().into())
 }
 
-fn pin_select<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &PciIO, codec: Codec, node: Node, index: usize) -> uefi::Result {
-    let len = bus.exec(make_command(codec, node, HDA_VERB_PARAMS, HDA_PARAM_CONNECTION_LIST_LENGTH))
-        .ignore_warning()?;
-    let select = bus.exec(make_command(codec, node, HDA_VERB_GET_CONNECTION_SELECT, Param(0x0)))
-        .ignore_warning()?;
-    info!("pin_select: {:?} is changing connection select from {} to {}", node, select, index);
-    if index < len as usize {
-        bus.exec(make_command(codec, node, HDA_VERB_SET_CONNECTION_SELECT, Param(index as u32)))?;
-        let select = bus.exec(make_command(codec, node, HDA_VERB_GET_CONNECTION_SELECT, Param(0x0)))
-            .ignore_warning()?;
-        info!("pin_select: -- readback: {}", select);
-    }
-    Ok(().into())
-}
-
-#[derive(Debug)]
-struct PinCapabilities {
-    impedance_sense_capable: u32,
-    trigger_required: u32,
-    presence_detect_capable: u32,
-    headphone_drive_capable: u32,
-    output_capable: u32,
-    input_capable: u32,
-    balanced_io_pins: u32,
-    hdmi: u32,
-    vref_control: u32,
-    eapd_capable: u32,
-    display_port: u32,
-    high_bit_rate: u32
-}
-
-impl PinCapabilities {
-    fn from(caps: u32) -> PinCapabilities {
-        PinCapabilities {
-            impedance_sense_capable: caps & 1,
-            trigger_required: (caps >> 1) & 1,
-            presence_detect_capable: (caps >> 2) & 1,
-            headphone_drive_capable: (caps >> 3) & 1,
-            output_capable: (caps >> 4) & 1,
-            input_capable: (caps >> 5) & 1,
-            balanced_io_pins: (caps >> 6) & 1,
-            hdmi: (caps >> 7) & 1,
-            vref_control: (caps >> 8) & 0b11111111,
-            eapd_capable: (caps >> 16) & 1,
-            display_port: (caps >> 24) & 1,
-            high_bit_rate: (caps >> 27) & 1,
-        }
-    }
-}
-
 #[derive(Debug)]
 enum PathNode {
-    AudioOut {node: Node},
-    AudioIn {node: Node, connections: alloc::vec::Vec<Node>, select: usize },
-    AudioMix {node: Node, connections: alloc::vec::Vec<Node>, select: usize },
-    PinComplex {node: Node, connections: alloc::vec::Vec<Node>, select: usize, config: PinConfig, presence: Option<bool>}
+    AudioOut {
+        node: Node,
+        caps: WidgetCapabilities
+    },
+    AudioIn {
+        node: Node,
+        caps: WidgetCapabilities,
+        connections: alloc::vec::Vec<Node>,
+        select: usize
+    },
+    AudioMix {
+        node: Node,
+        caps: WidgetCapabilities,
+        connections: alloc::vec::Vec<Node>,
+        select: usize
+    },
+    AudioMux {
+        node: Node,
+        caps: WidgetCapabilities,
+        connections: alloc::vec::Vec<Node>,
+        select: usize
+    },
+    PinComplex {
+        node: Node,
+        caps: WidgetCapabilities,
+        connections: alloc::vec::Vec<Node>,
+        select: usize,
+        pin_caps: PinCapabilities,
+        config: PinConfig,
+        presence: Option<bool>
+    },
+    Power {
+        node: Node,
+        caps: WidgetCapabilities,
+        connections: alloc::vec::Vec<Node>
+    },
+    Volume {
+        node: Node,
+        caps: WidgetCapabilities,
+        connections: alloc::vec::Vec<Node>,
+        knob_capabilities: VolumeKnobCapabilities
+    },
+    Beep {
+        node: Node,
+        caps: WidgetCapabilities
+    },
+    Other {
+        node: Node
+    }
 }
 
 impl PathNode {
     fn node(&self) -> Node {
         match self {
-            &PathNode::AudioOut {node} => {node},
+            &PathNode::AudioOut {node, ..} => {node},
             &PathNode::AudioIn {node, ..} => {node},
             &PathNode::AudioMix {node, ..} => {node},
+            &PathNode::AudioMux {node, ..} => {node},
             &PathNode::PinComplex {node, ..} => {node},
-        }
-    }
-    fn select(&self) -> usize {
-        match self {
-            &PathNode::AudioOut {..} => {0},
-            &PathNode::AudioIn {select, ..} => {select},
-            &PathNode::AudioMix {select, ..} => {select},
-            &PathNode::PinComplex {select, ..} => {select},
+            &PathNode::Power {node, ..} => {node},
+            &PathNode::Volume {node, ..} => {node},
+            &PathNode::Beep {node, ..} => {node},
+            &PathNode::Other {node, ..} => {node},
         }
     }
     fn successors(&self) -> &[Node] {
@@ -1511,12 +1490,19 @@ impl PathNode {
             &PathNode::AudioOut {..} => {&[]},
             &PathNode::AudioIn {ref connections, ..} => {connections},
             &PathNode::AudioMix {ref connections, ..} => {connections},
+            &PathNode::AudioMux {ref connections, ..} => {connections},
             &PathNode::PinComplex {ref connections, ..} => {connections},
+            &PathNode::Power {ref connections, ..} => {connections},
+            &PathNode::Volume {ref connections, ..} => {connections},
+            &PathNode::Beep {..} => {&[]},
+            &PathNode::Other {..} => {&[]},
         }
     }
     fn is_dac(&self) -> bool {
         match self {
-            &PathNode::AudioOut {..} => {true},
+            &PathNode::AudioOut {..} |
+            &PathNode::AudioMix {..} |
+            &PathNode::AudioMux {..} => {true},
             _ => {false}
         }
     }
@@ -1524,13 +1510,13 @@ impl PathNode {
         match self {
             &PathNode::PinComplex {ref config, ref presence, ..} => {
                 // Table 109. Port Connectivity -- The Port Complex is connected to a jack
-                (config.port_connectivity == HDA_JACK_PORT_COMPLEX ||
-                 config.port_connectivity == HDA_JACK_PORT_BOTH) &&
+                (config.port_connectivity() == HDA_JACK_PORT_COMPLEX ||
+                 config.port_connectivity() == HDA_JACK_PORT_BOTH) &&
                 // Table 111. Default device -- HP Out
-                config.device == HDA_JACK_HP_OUT &&
+                config.device() == HDA_JACK_HP_OUT &&
                 presence.unwrap_or(false) &&
                 // Table 114. Misc -- Jack Detect Override
-                (config.misc & HDA_JACK_MISC_DETECT_OVERRIDE) == 0
+                (config.misc() & HDA_JACK_MISC_DETECT_OVERRIDE) == 0
             },
             _ => {false}
         }
@@ -1547,9 +1533,9 @@ fn codec_collect_nodes<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &
     let mut result = alloc::vec::Vec::with_capacity(count as usize);
     for n in start_id..(start_id + count) {
         let node = Node(n);
-        let cap = bus.exec(make_command(codec, node, HDA_VERB_PARAMS, HDA_PARAM_AUDIO_WIDGET_CAPABILITIES))
-            .ignore_warning()?;
-        let widget_type = WidgetCapabilities::from(cap).typ;
+        let caps = bus.exec(make_command(codec, node, HDA_VERB_PARAMS, HDA_PARAM_AUDIO_WIDGET_CAPABILITIES))
+            .ignore_warning()
+            .map(WidgetCapabilities::from)?;
         let len = bus.exec(make_command(codec, node, HDA_VERB_PARAMS, HDA_PARAM_CONNECTION_LIST_LENGTH))
             .ignore_warning()?;
         let mut connections = alloc::vec::Vec::new();
@@ -1576,33 +1562,58 @@ fn codec_collect_nodes<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &
             .ignore_warning()?;
         let select = usize::try_from(select)
             .unwrap_or(0);
-        if widget_type == HDA_WIDGET_AUDIO_OUT {
-            result.push(PathNode::AudioOut {node} );
-        } else if widget_type == HDA_WIDGET_AUDIO_IN {
-            result.push(PathNode::AudioIn {node, connections, select});
-        } else if widget_type == HDA_WIDGET_AUDIO_MIX {
-            result.push(PathNode::AudioMix {node, connections, select});
-        } else if widget_type == HDA_WIDGET_PIN_COMPLEX {
-            let pin_caps = bus.exec(make_command(codec, node, HDA_VERB_PARAMS, HDA_PARAM_PIN_WIDGET_CAPABILITIES))
-                .ignore_warning()
-                .map(PinCapabilities::from)?;
-            let mut presence = None;
-            if pin_caps.presence_detect_capable != 0 {
-                if pin_caps.trigger_required != 0 {
-                    bus.exec(make_command(codec, node, HDA_VERB_EXECUTE_PIN_SENSE, Param(0x0)))
+        match caps.typ() {
+            HDA_WIDGET_AUDIO_OUT => {
+                result.push(PathNode::AudioOut {node, caps} );
+            },
+            HDA_WIDGET_AUDIO_IN => {
+                result.push(PathNode::AudioIn {node, caps, connections, select});
+            },
+            HDA_WIDGET_AUDIO_MIX => {
+                result.push(PathNode::AudioMix {node, caps, connections, select});
+            },
+            HDA_WIDGET_AUDIO_SELECTOR => {
+                result.push(PathNode::AudioMux {node, caps, connections, select});
+            },
+            HDA_WIDGET_PIN_COMPLEX => {
+                let pin_caps = bus.exec(make_command(codec, node, HDA_VERB_PARAMS, HDA_PARAM_PIN_WIDGET_CAPABILITIES))
+                    .ignore_warning()
+                    .map(PinCapabilities::from)?;
+                let mut presence = None;
+                if pin_caps.presence_detect_capable() != 0 {
+                    if pin_caps.trigger_required() != 0 {
+                        bus.exec(make_command(codec, node, HDA_VERB_EXECUTE_PIN_SENSE, Param(0x0)))
+                            .ignore_warning()?;
+                    }
+                    let response = bus.exec(make_command(codec, node, HDA_VERB_GET_PIN_SENSE, Param(0x0)))
                         .ignore_warning()?;
+                    presence = Some((response & HDA_PIN_SENSE_PRESENCE_DETECT) != 0);
                 }
-                let response = bus.exec(make_command(codec, node, HDA_VERB_GET_PIN_SENSE, Param(0x0)))
-                    .ignore_warning()?;
-                presence = Some((response & HDA_PIN_SENSE_PRESENCE_DETECT) != 0);
+                result.push(PathNode::PinComplex {
+                    node,
+                    connections,
+                    caps,
+                    config,
+                    select,
+                    pin_caps,
+                    presence
+                });
+            },
+            HDA_WIDGET_POWER => {
+                result.push(PathNode::Power {node, caps, connections});
+            },
+            HDA_WIDGET_VOLUME_KNOB => {
+                let knob_capabilities = bus.exec(make_command(codec, node, HDA_VERB_PARAMS, HDA_PARAM_VOLUME_KNOB_CAPABILITIES))
+                    .ignore_warning()
+                    .map(VolumeKnobCapabilities::from)?;
+                result.push(PathNode::Volume {node, caps, connections, knob_capabilities});
+            },
+            HDA_WIDGET_BEEP_GEN => {
+                result.push(PathNode::Beep {node, caps});
+            },
+            _ => {
+                result.push(PathNode::Other {node});
             }
-            result.push(PathNode::PinComplex {
-                node,
-                connections,
-                config,
-                select,
-                presence
-            });
         }
     }
     Ok ((result.into()))
@@ -1636,7 +1647,7 @@ struct NodeMap<T> {
     elems: alloc::vec::Vec<(Node, T)>
 }
 
-impl<T: Copy + Clone> NodeMap<T> {
+impl<T> NodeMap<T> {
     fn new() -> NodeMap<T> {
         NodeMap {
             elems: alloc::vec::Vec::new()
@@ -1664,11 +1675,11 @@ impl<T: Copy + Clone> NodeMap<T> {
         }
     }
 
-    fn get(&self, key: Node) -> Option<T> {
+    fn get(&self, key: Node) -> Option<&T> {
         self.elems
             .iter()
             .find(|elem| elem.0 == key)
-            .map(|elem| elem.1)
+            .map(|elem| &elem.1)
     }
 }
 
@@ -1683,7 +1694,7 @@ fn hda_find_dac<'a, F: Fn(Node) -> Option<&'a PathNode>>(vertices: F, start: Nod
                 let mut pivot = pivot;
                 while let Some(parent) = path.get(pivot) {
                     result.push(pivot);
-                    pivot = parent;
+                    pivot = *parent;
                 }
                 result.push(pivot);
                 return Some(result);
@@ -1726,25 +1737,40 @@ fn codec_setup_stream<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &P
         .ignore_warning()
         .map(parse_node_count)?;
     info!("sub nodes: {} nodes starting from {}", start_id, count);
+    pin_power(bus, codec, afg, true)?;
     let afg_amp_caps = bus.exec(make_command(codec, afg, HDA_VERB_PARAMS, HDA_PARAM_AMPLIFIER_OUTPUT_CAPABILITY))
         .ignore_warning()
         .map(AmpCapabilities::from)?;
-    pin_power(bus, device, pci, codec, afg, true)?;
+    info!("AFG Output Amplifier Capabilities: {:#?}", afg_amp_caps);
     // As preparation we power-up all widgets and accomplish
     // basic preparations so to minimize the warmup time
     for n in start_id..(start_id + count) {
-        pin_power(bus, device, pci, codec, Node(n), true)?;
-        pin_enable_output(bus, device, pci, codec, Node(n), true)?;
+        pin_power(bus, codec, Node(n), true)?;
+        // TBD: for mixers and selectors we need to enable input as well
+        pin_enable_output(bus, codec, Node(n), true)?;
     }
+    // Collect appropriate nodes and filter out digital out
+    // and output-incapable PINs
     // TBD: filter DACs that do not support requested PCM format
     let nodes = codec_collect_nodes(bus, device, pci, codec)
-        .ignore_warning()?;
+        .ignore_warning()?
+        .into_iter()
+        .filter(|node| {
+            if let PathNode::PinComplex {ref caps, ref pin_caps, ..} = node {
+                pin_caps.output_capable() != 0 &&
+                    caps.digital() == 0
+            } else {
+                true
+            }
+        })
+        .collect::<alloc::vec::Vec<_>>()
+        ;
     info!("codec_setup_stream: nodes {:#?}", nodes);
-    let mut node_map = NodeMap::new();
+    let mut node_map = NodeMap::<&PathNode>::new();
     for path_node in nodes.iter() {
         node_map.insert(&path_node.node(), path_node);
     }
-    let vertices = |node| node_map.get(node);
+    let vertices = |node| node_map.get(node).cloned();
     let mut active_nodes = NodeMap::new();
     for headphones in [ true, false ] {
         // TBD: how association and sequence can be useful?
@@ -1760,20 +1786,21 @@ fn codec_setup_stream<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &P
                     for path_node in nodes.iter().filter(|path_node| !active_nodes.contains_key(&path_node.node())) {
                         if path.contains(&path_node.node()) {
                             pin_mute_unmute(bus, codec, Some(&afg_amp_caps), path_node.node(), false)?;
-                            pin_enable_eapd(bus, device, pci, codec, path_node.node(), true)?;
+                            pin_enable_eapd(bus, codec, path_node.node(), true)?;
                             if let Some(next_node) = get_path_next_node(&path, path_node.node()) {
                                 if let Some(index) = find_path_connection_index(vertices, path_node.node(), next_node) {
                                     // Note that it is not possible to override previous pin selection
                                     // because we always choose lexigraphically first connection to a DAC
                                     // and do not change the graph description during entire configuration step.
-                                    pin_select(bus, device, pci, codec, path_node.node(), index)?;
+                                    pin_select(bus, codec, path_node.node(), index)?;
                                 }
                             }
                             match path_node {
                                 &PathNode::AudioOut {..} |
+                                &PathNode::AudioMux {..} |
                                 &PathNode::AudioMix {..} => {
-                                    codec_set_stream(bus, device, pci, codec, path_node.node(), PCI_SDCTL8_STREAM_1_MASK)?;
-                                    codec_set_format(bus, device, pci, codec, path_node.node(), format)?;
+                                    codec_set_stream(bus, codec, path_node.node(), PCI_SDCTL8_STREAM_1_MASK)?;
+                                    codec_set_format(bus, codec, path_node.node(), format)?;
                                 }
                                 _ => {}
                             }
@@ -1793,60 +1820,39 @@ fn codec_setup_stream<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &P
             break;
         }
     }
+    // Adjust volume level on all volume knobs that are
+    // wired to any active nodes.
+    for knob_node in nodes.iter() {
+        if let PathNode::Volume {..} = knob_node {
+            // TBD: use dfs to trace path to an active node?
+            let wired_to_an_active_node = knob_node
+                .successors()
+                .iter()
+                .any(|succ| active_nodes.contains_key(succ));
+            if wired_to_an_active_node {
+                // TBD: mute the node otherwise?
+                info!("activate volume knob {:?}", knob_node.node());
+                // TBD: check volume knob capabilities
+                pin_set_volume(bus, codec, knob_node.node());
+            }
+        }
+        // Mark volume knob as active
+        active_nodes.insert(&knob_node.node(), true);
+    }
     // Mute everything else
     for path_node in nodes.iter().filter(|path_node| !active_nodes.contains_key(&path_node.node())) {
         pin_mute_unmute(bus, codec, Some(&afg_amp_caps), path_node.node(), true)?;
         match path_node {
             &PathNode::AudioOut {..} |
+            &PathNode::AudioMux {..} |
             &PathNode::AudioMix {..} => {
-                codec_set_stream(bus, device, pci, codec, path_node.node(), 0)?;
-                codec_set_format(bus, device, pci, codec, path_node.node(), 0)?;
+                codec_set_stream(bus, codec, path_node.node(), 0)?;
+                codec_set_format(bus, codec, path_node.node(), 0)?;
             }
             _ => {}
         }
     }
     Ok(().into())
-}
-
-#[derive(Debug)]
-struct PinConfig {
-    sequence: u32,
-    association: u32,
-    misc: u32,
-    color: u32,
-    typ: u32,
-    device: u32,
-    location: u32,
-    port_connectivity: u32,
-}
-
-impl PinConfig {
-    fn from(cfg: u32) -> PinConfig {
-        PinConfig {
-            sequence: (cfg >> 0) & 0b1111,
-            association: (cfg >> 4) & 0b1111,
-            misc: (cfg >> 8) & 0xf,
-            color: (cfg >> 12) & 0b1111,
-            typ: (cfg >> 16) & 0b1111,
-            device: (cfg >> 20) & 0b1111,
-            location: (cfg >> 24) & 0b111111,
-            port_connectivity: (cfg >> 30) & 0b11,
-        }
-    }
-}
-
-struct WidgetCapabilities {
-    channels: u32,
-    typ: u32
-}
-
-impl WidgetCapabilities {
-    fn from(caps: u32) -> WidgetCapabilities {
-        WidgetCapabilities {
-            channels: 2 * (((caps >> 13) & 0x7) + 1),
-            typ: (caps >> 20) & 0xf
-        }
-    }
 }
 
 fn stream_cleanup(device: &mut DeviceContext, pci: &PciIO) -> uefi::Result {
@@ -2285,8 +2291,8 @@ fn init_context(driver_handle: Handle, controller_handle: Handle, pci: &PciIO, c
         controller_handle,
         child_handle: controller_handle,                 // TBD: no handle at the moment of context creation
         driver_handle,
-        in_streams: u32::from(gcap.in_streams),
-        out_streams: u32::from(gcap.out_streams),
+        in_streams: u32::from(gcap.in_streams()),
+        out_streams: u32::from(gcap.out_streams()),
         codec,
         device_path,
         audio_interface: Box::new(SimpleAudioOut {
@@ -2447,7 +2453,7 @@ extern "efiapi" fn hda_start(this: &DriverBinding, controller_handle: Handle, re
         let gcap = GCAP.read(pci)
             .ignore_warning()
             .map(GlobalCapabilities::from)?;
-        if gcap.out_streams == 0 {
+        if gcap.out_streams() == 0 {
             info!("No output streams supported!");
             return uefi::Status::UNSUPPORTED.into();
         }
