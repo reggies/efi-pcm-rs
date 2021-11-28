@@ -1631,43 +1631,36 @@ impl<T: Sized> Fifo<T> {
     }
 }
 
-struct NodeMap<T> {
-    elems: alloc::vec::Vec<(Node, T)>
-}
+struct NodeMap<T>(alloc::vec::Vec<Option<T>>);
 
 impl<T> NodeMap<T> {
     fn new() -> NodeMap<T> {
-        NodeMap {
-            elems: alloc::vec::Vec::new()
-        }
+        NodeMap (alloc::vec::Vec::new())
     }
 
     fn is_empty(&self) -> bool {
-        self.elems.is_empty()
+        self.0.is_empty()
     }
 
-    fn contains_key(&self, node: &Node) -> bool {
-        self.elems
-            .iter()
-            .any(|guess| guess.0 == *node)
+    fn contains_key(&self, key: &Node) -> bool {
+        self.0
+            .get(key.0 as usize)
+            .map(Option::as_ref)
+            .flatten()
+            .is_some()
     }
 
     fn insert(&mut self, key: &Node, value: T) {
-        let result = self.elems
-            .iter_mut()
-            .find(|elem| elem.0 == *key);
-        if let Some(elem) = result {
-            *elem = (*key, value);
-        } else {
-            self.elems.push((*key, value));
+        if key.0 as usize >= self.0.len() {
+            self.0.resize_with(key.0 as usize + 1, || None);
         }
+        self.0[key.0 as usize] = Some(value);
     }
 
     fn get(&self, key: Node) -> Option<&T> {
-        self.elems
-            .iter()
-            .find(|elem| elem.0 == key)
-            .map(|elem| &elem.1)
+        self.0
+            .get(key.0 as usize)
+            .and_then(Option::as_ref)
     }
 }
 
