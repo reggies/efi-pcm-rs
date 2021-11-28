@@ -16,6 +16,5 @@ uefi-services = { git = "ssh://git@github.com/reggies/uefi-rs" }
 uefi-macros = { git = "ssh://git@github.com/reggies/uefi-rs" }
 
 log = { version = "0.4.11", default-features = false }
-bitflags = "*"
 efi-pcm = { path = "../efi-pcm" }
 efi-dxe = { path = "../efi-dxe", features = ["log_serial"] }

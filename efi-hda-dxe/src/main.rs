@@ -37,12 +37,9 @@ extern crate log;
 extern crate uefi;
 #[macro_use]
 extern crate alloc;
-#[macro_use]
-extern crate bitflags;
 extern crate efi_pcm;
 extern crate efi_dxe;
 
-use bitflags::bitflags;
 use uefi::prelude::*;
 use uefi::proto::driver_binding::DriverBinding;
 use uefi::proto::component_name::{ComponentName2,ComponentName};
@@ -441,7 +438,7 @@ fn in_stream(gcap: &GlobalCapabilities, index: usize) -> StreamRegisterSet {
 }
 
 fn out_stream_1(device: &DeviceContext) -> StreamRegisterSet {
-    StreamRegisterSet::new(u32::from(device.in_streams))
+    StreamRegisterSet::new(device.in_streams)
 }
 
 #[repr(C, packed)]
@@ -522,60 +519,42 @@ impl DerefMut for EventGuard {
     }
 }
 
-static mut DEVICE_CONTEXTS: Option<alloc::vec::Vec<Box<DeviceContext>>> = None;
+static mut DEVICE_CONTEXTS: alloc::vec::Vec<Box<DeviceContext>> = alloc::vec::Vec::new();
 
 impl DeviceContext {
     // BootServices reference is only needed to inherit its lifetime
-    fn from_protocol<'a>(_bs: &'a uefi::table::boot::BootServices, raw: *const SimpleAudioOut) -> Option<&'a DeviceContext> {
+    fn from_protocol(_bs: &uefi::table::boot::BootServices, raw: *const SimpleAudioOut) -> Option<&DeviceContext> {
         unsafe {
             DEVICE_CONTEXTS
-                .as_ref()
-                .and_then(|contexts| {
-                    contexts.iter().find(|&context| {
-                        &*context.audio_interface as *const SimpleAudioOut == raw
-                    })
-                })
-                .map(|context| {
-                    context.as_ref()
-                })
+                .iter()
+                .find(|&context| core::ptr::eq(&*context.audio_interface, raw))
+                .map(alloc::boxed::Box::as_ref)
         }
     }
 
     // BootServices reference is only needed to inhert its lifetime
-    fn from_protocol_mut<'a>(_bs: &'a uefi::table::boot::BootServices, raw: *mut SimpleAudioOut) -> Option<&'a mut DeviceContext> {
+    fn from_protocol_mut(_bs: &uefi::table::boot::BootServices, raw: *mut SimpleAudioOut) -> Option<&mut DeviceContext> {
         unsafe {
             DEVICE_CONTEXTS
-                .as_deref_mut()
-                .and_then(|contexts| {
-                    contexts.iter_mut().find(|context| {
-                        & *context.audio_interface as *const SimpleAudioOut == raw as *const SimpleAudioOut
-                    })
-                })
-                .map(|context| {
-                    context.as_mut()
-                })
+                .iter_mut()
+                .find(|context| core::ptr::eq(&*context.audio_interface, raw))
+                .map(alloc::boxed::Box::as_mut)
         }
     }
-}
 
-fn register_device_context(device: Box<DeviceContext>) {
-    unsafe {
-        DEVICE_CONTEXTS
-            .as_mut()
-            .unwrap()
-            .push(device)
-            ;
+    fn register(self: Box<DeviceContext>) {
+        unsafe {
+            DEVICE_CONTEXTS
+                .push(self)
+                ;
+        }
     }
-}
 
-fn unregister_device_context(device: &DeviceContext) {
-    unsafe {
-        DEVICE_CONTEXTS
-            .as_mut()
-            .unwrap()
-            .retain(|context| {
-                &**context as *const DeviceContext != device as *const DeviceContext
-            })
+    fn unregister(&self) {
+        unsafe {
+            DEVICE_CONTEXTS
+                .retain(|context| !core::ptr::eq(&**context, self))
+        }
     }
 }
 
@@ -728,6 +707,13 @@ impl<'a> Drop for CommandResponseBuffers<'a> {
     }
 }
 
+fn inspect<'a, E: Debug + 'a>(name: &'a str) -> impl FnOnce(E) -> E + 'a {
+    move |errdata| {
+        error!("{} returned {:?}", name, errdata);
+        errdata
+    }
+}
+
 fn sfence() {
     // TBD: fence does not guarantee volatile memory access order
     core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
@@ -747,17 +733,11 @@ impl<'a> CommandResponseBuffers<'a> {
     fn new(pci: &'a PciIO) -> uefi::Result<CommandResponseBuffers<'a>> {
         let corb = pci
             .map_ex(uefi::proto::pci::IoOperation::BusMasterWrite)
-            .map_err(|error| {
-                error!("corb: pci map returned {:?}", error.status());
-                error
-            })
+            .map_err(inspect("PCI I/O map_ex(CORB)"))
             .ignore_warning()?;
         let rirb = pci
             .map_ex(uefi::proto::pci::IoOperation::BusMasterWrite)
-            .map_err(|error| {
-                error!("rirb: pci map returned {:?}", error.status());
-                error
-            })
+            .map_err(inspect("PCI I/O map_ex(RIRB)"))
             .ignore_warning()?;
         if (corb.device_address() & 0b1111111) != 0 {
             error!("CORB address {:#x} is not supported", corb.device_address());
@@ -798,25 +778,19 @@ impl<'a> CommandResponseBuffers<'a> {
         RIRBCTL.and(pci, !PCI_RIRBCTL_DMA_BIT)?;
         CORBCTL.and(pci, !PCI_CORBCTL_DMA_BIT)?;
         CORBCTL.wait(pci, 1000, PCI_CORBCTL_DMA_BIT, 0)
-            .map_err(|e| {error!("wait CORBCTL.DMA=0: {:?}", e.status()); e})?;
+            .map_err(inspect("wait CORBCTL.DMA=0"))?;
         RIRBCTL.wait(pci, 1000, PCI_RIRBCTL_DMA_BIT, 0)
-            .map_err(|e| {error!("wait RIRBCTL.DMA=0: {:?}", e.status()); e})?;
+            .map_err(inspect("wait RIRBCTL.DMA=0"))?;
 
         // Reset the read pointer. Read pointer bits are not
         // really RO on both qemu and vbox so we must write
         // 0's.
         CORBRP.update(pci, PCI_CORBRP_RST_BIT, !PCI_CORBRP_RSVDP_MASK)?;
         CORBRP.wait(pci, 1000, PCI_CORBRP_RST_BIT, PCI_CORBRP_RST_BIT)
-            .map_err(|error| {
-                error!("wait CORBRP.RST=1: {:?}", error.status());
-                error
-            })?;
+            .map_err(inspect("wait CORBRP.RST=1"))?;
         CORBRP.and(pci, !PCI_CORBRP_RST_BIT)?;
         CORBRP.wait(pci, 1000, PCI_CORBRP_RST_BIT, 0)
-            .map_err(|error| {
-                error!("wait CORBRP.RST=0: {:?}", error.status());
-                error
-            })?;
+            .map_err(inspect("wait CORBRP.RST=0"))?;
 
         // Reset the write pointer.
         CORBWP.and(pci, PCI_CORBWP_RSVDP_MASK)?;
@@ -1148,12 +1122,12 @@ fn make_command(codec: Codec, node: Node, verb: Verb, param: Param) -> u32 {
 }
 
 #[cfg(immediate_command_mode)]
-fn make_bus_io<'a>(pci: &'a PciIO) -> uefi::Result<Immediate<'a>> {
+fn make_bus_io(pci: &PciIO) -> uefi::Result<Immediate> {
     Immediate::new(pci)
 }
 
 #[cfg(not(immediate_command_mode))]
-fn make_bus_io<'a>(pci: &'a PciIO) -> uefi::Result<CommandResponseBuffers<'a>> {
+fn make_bus_io(pci: &PciIO) -> uefi::Result<CommandResponseBuffers> {
     CommandResponseBuffers::new(pci)
 }
 
@@ -1493,41 +1467,36 @@ enum PathNode {
 impl PathNode {
     fn node(&self) -> Node {
         match self {
-            &PathNode::AudioOut {node, ..} => {node},
-            &PathNode::AudioIn {node, ..} => {node},
-            &PathNode::AudioMix {node, ..} => {node},
-            &PathNode::AudioMux {node, ..} => {node},
-            &PathNode::PinComplex {node, ..} => {node},
-            &PathNode::Power {node, ..} => {node},
-            &PathNode::Volume {node, ..} => {node},
-            &PathNode::Beep {node, ..} => {node},
-            &PathNode::Other {node, ..} => {node},
+            PathNode::AudioOut {ref node, ..} => *node,
+            PathNode::AudioIn {ref node, ..} => *node,
+            PathNode::AudioMix {ref node, ..} => *node,
+            PathNode::AudioMux {ref node, ..} => *node,
+            PathNode::PinComplex {ref node, ..} => *node,
+            PathNode::Power {ref node, ..} => *node,
+            PathNode::Volume {ref node, ..} => *node,
+            PathNode::Beep {ref node, ..} => *node,
+            PathNode::Other {ref node, ..} => *node,
         }
     }
     fn successors(&self) -> &[Node] {
         match self {
-            &PathNode::AudioOut {..} => {&[]},
-            &PathNode::AudioIn {ref connections, ..} => {connections},
-            &PathNode::AudioMix {ref connections, ..} => {connections},
-            &PathNode::AudioMux {ref connections, ..} => {connections},
-            &PathNode::PinComplex {ref connections, ..} => {connections},
-            &PathNode::Power {ref connections, ..} => {connections},
-            &PathNode::Volume {ref connections, ..} => {connections},
-            &PathNode::Beep {..} => {&[]},
-            &PathNode::Other {..} => {&[]},
+            PathNode::AudioOut {..} => &[],
+            PathNode::AudioIn {ref connections, ..} => connections,
+            PathNode::AudioMix {ref connections, ..} => connections,
+            PathNode::AudioMux {ref connections, ..} => connections,
+            PathNode::PinComplex {ref connections, ..} => connections,
+            PathNode::Power {ref connections, ..} => connections,
+            PathNode::Volume {ref connections, ..} => connections,
+            PathNode::Beep {..} => &[],
+            PathNode::Other {..} => &[],
         }
     }
     fn is_dac(&self) -> bool {
-        match self {
-            &PathNode::AudioOut {..} |
-            &PathNode::AudioMix {..} |
-            &PathNode::AudioMux {..} => {true},
-            _ => {false}
-        }
+        matches!(self, PathNode::AudioOut {..} | PathNode::AudioMix {..} | PathNode::AudioMux {..})
     }
     fn is_headphones(&self) -> bool {
         match self {
-            &PathNode::PinComplex {ref config, ref presence, ..} => {
+            PathNode::PinComplex {ref config, ref presence, ..} => {
                 // Table 109. Port Connectivity -- The Port Complex is connected to a jack
                 (config.port_connectivity() == HDA_JACK_PORT_COMPLEX ||
                  config.port_connectivity() == HDA_JACK_PORT_BOTH) &&
@@ -1537,7 +1506,7 @@ impl PathNode {
                 // Table 114. Misc -- Jack Detect Override
                 (config.misc() & HDA_JACK_MISC_DETECT_OVERRIDE) == 0
             },
-            _ => {false}
+            _ => false,
         }
     }
 }
@@ -1635,7 +1604,7 @@ fn codec_collect_nodes<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &
             }
         }
     }
-    Ok ((result.into()))
+    Ok (result.into())
 }
 
 struct Fifo<T> {
@@ -1815,14 +1784,9 @@ fn codec_setup_stream<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &P
                                     pin_select(bus, codec, path_node.node(), index)?;
                                 }
                             }
-                            match path_node {
-                                &PathNode::AudioOut {..} |
-                                &PathNode::AudioMux {..} |
-                                &PathNode::AudioMix {..} => {
-                                    codec_set_stream(bus, codec, path_node.node(), PCI_SDCTL8_STREAM_1_MASK)?;
-                                    codec_set_format(bus, codec, path_node.node(), format)?;
-                                }
-                                _ => {}
+                            if path_node.is_dac() {
+                                codec_set_stream(bus, codec, path_node.node(), PCI_SDCTL8_STREAM_1_MASK)?;
+                                codec_set_format(bus, codec, path_node.node(), format)?;
                             }
                         }
                     }
@@ -1862,14 +1826,9 @@ fn codec_setup_stream<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &P
     // Mute everything else
     for path_node in nodes.iter().filter(|path_node| !active_nodes.contains_key(&path_node.node())) {
         pin_mute_unmute(bus, codec, Some(&afg_amp_caps), path_node.node(), true)?;
-        match path_node {
-            &PathNode::AudioOut {..} |
-            &PathNode::AudioMux {..} |
-            &PathNode::AudioMix {..} => {
-                codec_set_stream(bus, codec, path_node.node(), 0)?;
-                codec_set_format(bus, codec, path_node.node(), 0)?;
-            }
-            _ => {}
+        if path_node.is_dac() {
+            codec_set_stream(bus, codec, path_node.node(), 0)?;
+            codec_set_format(bus, codec, path_node.node(), 0)?;
         }
     }
     Ok(().into())
@@ -2056,7 +2015,7 @@ fn stream_select_rate(device: &mut DeviceContext, pci: &PciIO, sampling_rate: u3
         .iter()
         .min_by_key(|&&guess| abs_diff(guess, sampling_rate))
         .cloned()
-        .ok_or_else(|| uefi::Status::UNSUPPORTED)?;
+        .ok_or(uefi::Status::UNSUPPORTED)?;
     if channel_count != 2 {
         return Err(uefi::Status::UNSUPPORTED.into());
     }
@@ -2123,10 +2082,7 @@ impl<'a> DmaControl for Loop<'a> {
 fn stream_play_loop(device: &mut DeviceContext, pci: &PciIO, duration: u64, samples: &[i16], sampling_rate: u32, channel_count: u8) -> uefi::Result {
     let mut bdl_dma = pci
         .map_ex::<BufferDescriptorListWithBuffers>(uefi::proto::pci::IoOperation::BusMasterWrite)
-        .map_err(|error| {
-            error!("map operation failed: {:?}", error.status());
-            error
-        })
+        .map_err(inspect("PCI I/O map_ex(BDL)"))
         .ignore_warning()?;
 
     let (format, closest_rate) = stream_select_rate(device, pci, sampling_rate, channel_count)
@@ -2172,10 +2128,7 @@ extern "efiapi" fn hda_tone(this: &mut SimpleAudioOut, freq: u16, duration: u16)
             device.driver_handle,
             device.child_handle,
             OpenAttribute::GET_PROTOCOL)
-        .map_err(|error| {
-            error!("failed to open PCI I/O protocol: {:?}", error.status());
-            error
-        })
+        .map_err(inspect("OpenProtocol PCI I/O"))
         .ignore_warning()?;
     pci.dont_close();
     let channel_count = 2;
@@ -2210,10 +2163,7 @@ extern "efiapi" fn hda_write(this: &mut SimpleAudioOut, sampling_rate: u32, chan
             device.driver_handle,
             device.child_handle,
             OpenAttribute::GET_PROTOCOL)
-        .map_err(|error| {
-            error!("failed to open PCI I/O protocol: {:?}", error.status());
-            error
-        })
+        .map_err(inspect("OpenProtocol PCI I/O"))
         .ignore_warning()?;
     pci.dont_close();
     if channel_count != 2 {
@@ -2338,7 +2288,7 @@ fn fill_bde(buffer: &mut SampleBuffer, descriptor: &mut Descriptor, samples_posi
     while samples_to_copy > 0 {
         let count = (samples.len() - samples_position).min(samples_to_copy);
         // TBD: copy volatile?
-        &mut buffer.samples[bdl_pos..bdl_pos+count]
+        buffer.samples[bdl_pos..bdl_pos+count]
             .copy_from_slice(&samples[samples_position..samples_position+count]);
         bdl_pos += count;
         samples_position = (samples_position + count) % samples.len();
@@ -2435,7 +2385,7 @@ extern "efiapi" fn hda_supported(this: &DriverBinding, handle: Handle, remaining
         })
     };
     if !supported {
-        return uefi::Status::UNSUPPORTED.into();
+        return uefi::Status::UNSUPPORTED;
     }
     info!("hda_supported -- ok");
     uefi::Status::SUCCESS
@@ -2453,10 +2403,7 @@ extern "efiapi" fn hda_start(this: &DriverBinding, controller_handle: Handle, re
             this.driver_handle(),
             controller_handle,
             OpenAttribute::BY_DRIVER)
-        .map_err(|error| {
-            error!("failed to open PCI I/O protocol: {:?}", error.status());
-            error
-        })
+        .map_err(inspect("OpenProtocol PCI I/O"))
         .ignore_warning()?;
     {
         // SAFETY: safe as long as no other references exist in our code
@@ -2472,7 +2419,7 @@ extern "efiapi" fn hda_start(this: &DriverBinding, controller_handle: Handle, re
             .map(GlobalCapabilities::from)?;
         if gcap.out_streams() == 0 {
             info!("No output streams supported!");
-            return uefi::Status::UNSUPPORTED.into();
+            return uefi::Status::UNSUPPORTED;
         }
 
         let detected_codecs = bus_probe_codecs(pci, codec_mask).ignore_warning()?;
@@ -2501,10 +2448,7 @@ fn bus_create_child<B: BusIo>(driver_handle: Handle, controller_handle: Handle, 
             audio_out,
             device_path
         )
-        .map_err(|error| {
-            error!("failed to create child handle: {:?}", error.status());
-            error
-        })
+        .map_err(inspect("InstallMultipleProtocolInterfaces"))
         .ignore_warning()?;
     device.child_handle = child_handle;
     let result = boot_services()
@@ -2532,7 +2476,7 @@ fn bus_create_child<B: BusIo>(driver_handle: Handle, controller_handle: Handle, 
     // produce audio protocol and let it live in database as
     // long as the driver's image stay resident or until the
     // DisconnectController() will be invoked
-    register_device_context(device);
+    device.register();
     uefi::Status::SUCCESS.into()
 }
 
@@ -2546,10 +2490,7 @@ fn hda_stop_bus(this: &DriverBinding, controller: Handle) -> uefi::Result {
             this.driver_handle(),
             controller,
             OpenAttribute::BY_DRIVER)
-        .map_err(|error| {
-            error!("failed to open PCI I/O protocol: {:?}", error.status());
-            error
-        })
+        .map_err(inspect("OpenProtocol PCI I/O"))
         .ignore_warning()?;
     pci.dont_close();
     {
@@ -2562,10 +2503,7 @@ fn hda_stop_bus(this: &DriverBinding, controller: Handle) -> uefi::Result {
         bus_stop(pci)?;
     }
     pci.close()
-        .map_err(|error| {
-            error!("failed to close PCI I/O protocol: {:?}", error.status());
-            error
-        })
+        .map_err(inspect("CloseProtocol PCI I/O"))
         .ignore_warning()?;
     info!("hda_stop_bus -- ok");
     uefi::Status::SUCCESS.into()
@@ -2583,10 +2521,7 @@ fn hda_stop_child(this: &DriverBinding, controller: Handle, child: Handle) -> ue
             this.driver_handle(),
             controller,
             OpenAttribute::GET_PROTOCOL)
-        .map_err(|error| {
-            error!("failed to open audio protocol: {:?}", error.status());
-            error
-        })
+        .map_err(inspect("OpenProtocol SimpleAudioOut"))
         .ignore_warning()?;
     // Opening protocol with GET_PROTOCOL does not require
     // use to close protocol but if we do we will remove all
@@ -2598,17 +2533,14 @@ fn hda_stop_child(this: &DriverBinding, controller: Handle, child: Handle) -> ue
             this.driver_handle(),
             controller,
             OpenAttribute::GET_PROTOCOL)
-        .map_err(|error| {
-            error!("failed to open PCI I/O protocol: {:?}", error.status());
-            error
-        })
+        .map_err(inspect("OpenProtocol PCI I/O"))
         .ignore_warning()?;
     pci.dont_close();
     let audio_out = audio_out.as_proto().get();
     // SAFETY: safe as long as no other references exist in our code
     // Note that this operation does not consume anything
     let device = DeviceContext::from_protocol_mut(boot_services(), audio_out)
-        .ok_or_else(|| uefi::Status::INVALID_PARAMETER)?;
+        .ok_or(uefi::Status::INVALID_PARAMETER)?;
     // SAFETY: safe as long as no other references exist in our code
     let audio_out = unsafe { audio_out                     // OpenProtocol<'boot>
                              .as_ref()                     // Option<&SimpleAudioOut>
@@ -2623,12 +2555,9 @@ fn hda_stop_child(this: &DriverBinding, controller: Handle, child: Handle) -> ue
             audio_out,
             device_path
         )
-        .map_err(|error| {
-            error!("failed uninstall audio protocols: {:?}", error.status());
-            error
-        })
+        .map_err(inspect("UninstallMultipleProtocolInterfaces"))
         .ignore_warning()?;
-    unregister_device_context(device);
+    device.unregister();
     info!("hda_stop_child -- ok");
     Ok(().into())                                // drop audio
 }
@@ -2646,7 +2575,7 @@ extern "efiapi" fn hda_stop_entry(this: &DriverBinding, controller: Handle, num_
                 .ignore_warning()
                 .map_err(|_| uefi::Status::DEVICE_ERROR.into())?;
         }
-        uefi::Status::SUCCESS.into()
+        uefi::Status::SUCCESS
     } else {
         hda_stop_bus(this, controller)
             .status()
@@ -2665,10 +2594,7 @@ extern "efiapi" fn hda_unload(image_handle: Handle) -> Status {
             image_handle,
             image_handle,
             OpenAttribute::GET_PROTOCOL)
-        .map_err(|error| {
-            error!("failed to open driver binding: {:?}", error.status());
-            error
-        })
+        .map_err(inspect("OpenProtocol DriverBinding"))
         .ignore_warning()?;
     // SAFETY: we do not offend uniqueness of driver
     //         binding mutable references and also we do not
@@ -2677,10 +2603,8 @@ extern "efiapi" fn hda_unload(image_handle: Handle) -> Status {
     let handles = boot_services()
         .find_handles::<PciIO>()
         .log_warning()
-        .map_err(|error| {
-            warn!("failed to get PCI I/O handles: {:?}", error.status());
-            error
-        }).or_else(|error| {
+        .map_err(inspect("find_handles PCI I/O"))
+        .or_else(|error| {
             if error.status() == uefi::Status::NOT_FOUND {
                 Ok(alloc::vec::Vec::new())
             } else {
@@ -2700,18 +2624,15 @@ extern "efiapi" fn hda_unload(image_handle: Handle) -> Status {
             warn!("failed to disconnect PCI I/O controller {:?}: {:?}", controller, error.status());
         }
     }
-    if unsafe { !DEVICE_CONTEXTS.as_ref().unwrap().is_empty() } {
+    if unsafe { !DEVICE_CONTEXTS.is_empty() } {
         error!("failed to disconnect some devices");
-        return uefi::Status::DEVICE_ERROR.into();
+        return uefi::Status::DEVICE_ERROR;
     }
     boot_services()
         .uninstall_multiple_protocol_interfaces1::<DriverBinding>(
             image_handle,
             driver_binding_ref)
-        .map_err(|error| {
-            error!("failed to uninstall driver binding: {:?}", error.status());
-            error
-        })
+        .map_err(inspect("UninstallMultipleProtocolInterfaces"))
         .ignore_warning()?;
     info!("hda_unload -- ok");
     // Cleanup allocator and logging facilities
@@ -2724,9 +2645,6 @@ fn efi_main(handle: Handle, system_table: SystemTable<Boot>) -> uefi::Status {
     efi_dxe::init(handle, &system_table)
         .ignore_warning()?;
     info!("hda_main");
-    unsafe {
-        DEVICE_CONTEXTS = Some(alloc::vec::Vec::new());
-    }
     driver_binding::init_driver_binding(handle);
     let loaded_image = boot_services()
         .handle_protocol::<LoadedImage>(handle)
@@ -2740,10 +2658,7 @@ fn efi_main(handle: Handle, system_table: SystemTable<Boot>) -> uefi::Status {
             &driver_binding::driver_binding(),
             &driver_binding::component_name(),
             &driver_binding::component_name2())
-        .map_err(|error| {
-            error!("failed to install driver binding: {:?}", error.status());
-            error
-        })
+        .map_err(inspect("InstallMultipleProtocolInterfaces"))
         .ignore_warning()?;
     info!("hda_main -- ok");
     uefi::Status::SUCCESS
