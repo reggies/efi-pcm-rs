@@ -1293,6 +1293,100 @@ fn pin_power<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &PciIO, cod
     uefi::Status::SUCCESS.into()
 }
 
+
+struct AmpCapabilities(u32);
+
+impl fmt::Debug for AmpCapabilities {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AmpCapabilities")
+            .field("offset", &self.offset())
+            .field("num_steps", &self.num_steps())
+            .field("step_size", &self.step_size())
+            .field("mute", &self.mute())
+            .finish()
+    }
+}
+
+impl AmpCapabilities {
+    pub fn from(caps: u32) -> AmpCapabilities {
+        AmpCapabilities(caps)
+    }
+    pub fn offset(&self) -> u32 {
+        self.0 & 0x7f
+    }
+    pub fn num_steps(&self) -> u32 {
+        (self.0 >> 8) & 0x7f
+    }
+    pub fn step_size(&self) -> u32 {
+        (self.0 >> 16) & 0x7f
+    }
+    pub fn mute(&self) -> bool {
+        (self.0 >> 31) & 1 == 1
+    }
+}
+
+#[derive(Debug)]
+struct Amps {
+    // TBD: handle index for widgets with multiple input amplifiers
+    output_left: AmpGain,
+    output_right: AmpGain,
+    input_left: AmpGain,
+    input_right: AmpGain,
+}
+
+fn pin_get_amps<B: BusIo>(bus: &mut B, codec: Codec, node: Node) -> uefi::Result<Amps> {
+    let output_left = bus.exec(make_command(codec, node, HDA_VERB_GET_AMPLIFIER_GAIN_MUTE, Param(HDA_AMPLIFIER_GAIN_MUTE_GET_OUT_BIT | HDA_AMPLIFIER_GAIN_MUTE_GET_LEFT_BIT)))
+        .ignore_warning()
+        .map(AmpGain::from)?;
+    let output_right = bus.exec(make_command(codec, node, HDA_VERB_GET_AMPLIFIER_GAIN_MUTE, Param(HDA_AMPLIFIER_GAIN_MUTE_GET_OUT_BIT)))
+        .ignore_warning()
+        .map(AmpGain::from)?;
+    let input_left = bus.exec(make_command(codec, node, HDA_VERB_GET_AMPLIFIER_GAIN_MUTE, Param(HDA_AMPLIFIER_GAIN_MUTE_GET_LEFT_BIT)))
+        .ignore_warning()
+        .map(AmpGain::from)?;
+    let input_right = bus.exec(make_command(codec, node, HDA_VERB_GET_AMPLIFIER_GAIN_MUTE, Param(0x0)))
+        .ignore_warning()
+        .map(AmpGain::from)?;
+    Ok (Amps {
+        output_left,
+        input_left,
+        output_right,
+        input_right,
+    }.into())
+}
+
+fn pin_mute_unmute<B: BusIo>(bus: &mut B, codec: Codec, afg_caps: Option<&AmpCapabilities>, node: Node, mute: bool) -> uefi::Result {
+    info!("pin_mute_unmute: {:?} {}", node, mute);
+    let pin_caps = bus.exec(make_command(codec, node, HDA_VERB_PARAMS, HDA_PARAM_AMPLIFIER_OUTPUT_CAPABILITY))
+        .ignore_warning()
+        .map(AmpCapabilities::from)?;
+    let amps = pin_get_amps(bus, codec, node).ignore_warning()?;
+    info!("pin_mute_unmute: mute = {}, {:?}", mute, amps);
+    let mut flags = HDA_AMPLIFIER_GAIN_MUTE_SETO_BIT
+        | HDA_AMPLIFIER_GAIN_MUTE_SETL_BIT
+        | HDA_AMPLIFIER_GAIN_MUTE_SETR_BIT;
+    if pin_caps.num_steps() != 0 {
+        // TBD: negative gain
+        // Note half of the min/max gain means half the volume
+        flags |= pin_caps.offset();
+    } else if afg_caps.map(AmpCapabilities::num_steps).unwrap_or(0) != 0 {
+        flags |= afg_caps.map(AmpCapabilities::offset).unwrap();
+    } else {
+        flags |= 0x7f;
+    }
+    // TBD: not correct. if pin has amplifier capability and
+    // has no mute support we must ignore afg capabilities
+    if afg_caps.map(AmpCapabilities::mute).unwrap_or(false) || pin_caps.mute() {
+        if mute {
+            flags |= HDA_AMPLIFIER_GAIN_MUTE_MUTE_BIT;
+        }
+    }
+    bus.exec(make_command(codec, node, HDA_VERB_SET_AMPLIFIER_GAIN_MUTE, Param(flags)))?;
+    let readback = pin_get_amps(bus, codec, node).ignore_warning()?;
+    info!("pin_mute_unmute: -- readback {:?}", readback);
+    Ok(().into())
+}
+
 fn codec_set_format<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &PciIO, codec: Codec, node: Node, format: u16) -> uefi::Result {
     info!("codec_set_format: {:?} format: {:#x}", node, format);
     bus.exec(make_command(codec, node, HDA_VERB_SET_STREAM_FORMAT, Param(u32::from(format))))?;
@@ -1335,26 +1429,6 @@ fn find_audio_function_node<B: BusIo>(bus: &mut B, pci: &PciIO, codec: Codec) ->
         return Err(uefi::Status::NOT_FOUND.into());
     }
     Ok(afg.unwrap().into())
-}
-
-fn pin_mute_unmute<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &PciIO, codec: Codec, node: Node, mute: bool) -> uefi::Result {
-    info!("pin_mute_unmute: {:?} {}", node, mute);
-    let amc = bus.exec(make_command(codec, node, HDA_VERB_PARAMS, HDA_PARAM_AMPLIFIER_OUTPUT_CAPABILITY))
-        .ignore_warning()?;
-    let offset = amc & HDA_AMPLIFIER_CAPABILITY_OFFSET_MASK;
-    if amc & HDA_AMPLIFIER_CAPABILITY_MUTE_BIT != 0 {
-        let mut flags = HDA_AMPLIFIER_GAIN_MUTE_SETO_BIT
-            | HDA_AMPLIFIER_GAIN_MUTE_SETL_BIT
-            | HDA_AMPLIFIER_GAIN_MUTE_SETR_BIT
-            | offset;
-        if mute {
-            flags |= HDA_AMPLIFIER_GAIN_MUTE_MUTE_BIT;
-        }
-        bus.exec(make_command(codec, node, HDA_VERB_SET_AMPLIFIER_GAIN_MUTE, Param(flags)))?;
-    } else {
-        warn!("pin_mute_unmute: not supported");
-    }
-    Ok(().into())
 }
 
 fn pin_select<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &PciIO, codec: Codec, node: Node, index: usize) -> uefi::Result {
@@ -1652,6 +1726,9 @@ fn codec_setup_stream<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &P
         .ignore_warning()
         .map(parse_node_count)?;
     info!("sub nodes: {} nodes starting from {}", start_id, count);
+    let afg_amp_caps = bus.exec(make_command(codec, afg, HDA_VERB_PARAMS, HDA_PARAM_AMPLIFIER_OUTPUT_CAPABILITY))
+        .ignore_warning()
+        .map(AmpCapabilities::from)?;
     pin_power(bus, device, pci, codec, afg, true)?;
     // As preparation we power-up all widgets and accomplish
     // basic preparations so to minimize the warmup time
@@ -1682,7 +1759,7 @@ fn codec_setup_stream<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &P
                     // active_nodes list and skip it.
                     for path_node in nodes.iter().filter(|path_node| !active_nodes.contains_key(&path_node.node())) {
                         if path.contains(&path_node.node()) {
-                            pin_mute_unmute(bus, device, pci, codec, path_node.node(), false)?;
+                            pin_mute_unmute(bus, codec, Some(&afg_amp_caps), path_node.node(), false)?;
                             pin_enable_eapd(bus, device, pci, codec, path_node.node(), true)?;
                             if let Some(next_node) = get_path_next_node(&path, path_node.node()) {
                                 if let Some(index) = find_path_connection_index(vertices, path_node.node(), next_node) {
@@ -1718,7 +1795,7 @@ fn codec_setup_stream<B: BusIo>(bus: &mut B, device: &mut DeviceContext, pci: &P
     }
     // Mute everything else
     for path_node in nodes.iter().filter(|path_node| !active_nodes.contains_key(&path_node.node())) {
-        pin_mute_unmute(bus, device, pci, codec, path_node.node(), true)?;
+        pin_mute_unmute(bus, codec, Some(&afg_amp_caps), path_node.node(), true)?;
         match path_node {
             &PathNode::AudioOut {..} |
             &PathNode::AudioMix {..} => {
