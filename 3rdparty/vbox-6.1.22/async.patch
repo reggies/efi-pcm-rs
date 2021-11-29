@@ -1,0 +1,13 @@
+diff --git a/VirtualBox/src/VBox/Devices/Audio/DevHda.cpp b/VirtualBox/src/VBox/Devices/Audio/DevHda.cpp
+index 5ca19300..8ca1d24c 100644
+--- a/VirtualBox/src/VBox/Devices/Audio/DevHda.cpp
++++ b/VirtualBox/src/VBox/Devices/Audio/DevHda.cpp
+@@ -4711,7 +4711,7 @@ static DECLCALLBACK(int) hdaR3Construct(PPDMDEVINS pDevIns, int iInstance, PCFGM
+      * thread from the DMA timer callback.  Because it's used from the DMA timer
+      * callback, it will implicitly be rounded up to the next timer period.
+      * This is for adding a little host scheduling leeway into the playback. */
+-    rc = pHlp->pfnCFGMQueryU16Def(pCfg, "InitialDelayMs", &pThis->msInitialDelay, 12);
++    rc = pHlp->pfnCFGMQueryU16Def(pCfg, "InitialDelayMs", &pThis->msInitialDelay, 0);
+     if (RT_FAILURE(rc))
+          return PDMDEV_SET_ERROR(pDevIns, rc, N_("HDA configuration error: failed to read 'InitialDelayMs' as uint16_t"));
+     if (pThis->msInitialDelay > 256)

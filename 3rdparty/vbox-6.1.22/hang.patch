@@ -1,0 +1,13 @@
+diff --git a/VirtualBox/src/VBox/Devices/Audio/DevHdaStream.cpp b/VirtualBox/src/VBox/Devices/Audio/DevHdaStream.cpp
+index 5ca19300..8ca1d24c 100644
+--- a/VBox/Devices/Audio/DevHdaStream.cpp
++++ b/VBox/Devices/Audio/DevHdaStream.cpp
+@@ -275,7 +275,7 @@
+         /* Reduce till we've below the threshold. */
+         uint32_t cbLoop = cbCurAligned;
+         do
+-            cbLoop = cbCurAligned / 2;
++            cbLoop = cbLoop / 2;
+         while (cbLoop > cbMaxPeriod);
+         cbLoop = PDMAudioPropsRoundUpBytesToFrame(pGuestProps, cbLoop);
+ 
