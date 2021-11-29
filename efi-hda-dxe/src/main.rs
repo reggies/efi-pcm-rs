@@ -1492,7 +1492,7 @@ impl PathNode {
         }
     }
     fn is_dac(&self) -> bool {
-        matches!(self, PathNode::AudioOut {..} | PathNode::AudioMix {..} | PathNode::AudioMux {..})
+        matches!(self, PathNode::AudioOut {..})
     }
     fn is_headphones(&self) -> bool {
         match self {
