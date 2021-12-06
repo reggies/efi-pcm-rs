@@ -1,14 +1,12 @@
-* TODO add ComponentName and ComponentName2
-* TODO make unsafe PCI I/O interfaces unsafe
-* TODO add asynchronous API
-* TODO add sound capture
+* add asynchronous API
+* add sound capture
 * long form NIDs
 * simplify hda_write by playing with CBL size
 * properly report all supported pcm formats
 * codec hotplug
+* jack hotplug
 * add volume control
   - DriverConfiguration would be great
 * add protocol for bus link controller
-* qemu does not recognize 0x34 register (ich6 ssync). wtf?
 * check 3.1.3 Behavior With 64-bit Addresses to
   - determine 64-bit support
